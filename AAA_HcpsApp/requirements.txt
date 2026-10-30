@@ -1,0 +1,24 @@
+# 采集/存储核心（A0/A1 层）所需的最小依赖
+PyYAML>=6.0
+pyserial>=3.5
+pylsl>=1.16
+# 分析层（A2，迁移 load_analyze / eye_analyze / face_model 时需要）
+numpy
+scipy
+pandas
+scikit-learn
+xgboost
+catboost
+biosppy
+hrv-analysis
+PyWavelets
+# 表情识别（A2_analyze_face：CNN3 权重 + BlazeFace tflite）
+tensorflow
+opencv-python
+# 对外链路（A5_link_ctrl：SSH 遥控采集卡主机）
+paramiko
+# 界面层（A3，新壳）
+PyQt5==5.15.11
+PyQt5-Fluent-Widgets
+qframelesswindow
+pyqtgraph

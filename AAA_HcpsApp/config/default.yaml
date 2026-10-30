@@ -1,0 +1,146 @@
+# HcpsApp 设备配置
+# 规则：一个设备一块，块名 = collector 名字（同时用作 DataPacket.device）
+# 取值来源在注释里标注了老 config.ini 的对应位置，方便对照。
+
+session:
+  root: 实验结果                 # 老工程同名目录
+  result_dir: normal_result      # 老工程同名子目录
+  db_name: database.db
+  auto_folder: true              # 自动建 <用户名>_<任务>_<YYYYmmdd>/normal_result
+
+collectors:
+  # ---- 心电：TCP 服务端，采集卡推 JSON 帧过来 ----
+  ecg:
+    enabled: true
+    transport: tcp_server
+    bind: 0.0.0.0                # 老配置里是 192.168.1.189（采集卡那台的 IP），本机跑要改 0.0.0.0
+    port: 8001                   # 老 [data_video_win] tcpserver_port，老代码借用了视频段，这里独立开
+
+  # ---- 眼动：UDP 服务端，SmartEye 推二进制帧 ----
+  eye:
+    enabled: true
+    transport: udp_server
+    bind: 0.0.0.0
+    port: 8003                   # 老 [data_UDP_win] com_port1
+    frame_rate: 30               # 老 newfrequency，仅记录用途
+
+  # ---- 表面肌电：LSL 流（老代码里的 IP/端口其实是摆设）----
+  emg:
+    enabled: false
+    transport: lsl
+    device_name: ExG5            # 老 [data_EMG_win] device_name
+    stream_predicate: "name='BLE_ExG5_TimeSeries'"
+    resolve_timeout: 5.0
+    pull_timeout: 5.0
+
+  # ---- 握力手套：串口（已迁移，方案二：A0 只采原始帧）----
+  grip:
+    enabled: false
+    transport: serial
+    port: COM5                   # 老 [data_grip_win] serial_port / [glove_config] port
+    baudrate: 115200             # 老 serial_rate / baudrate
+    bytesize: 8                  # 老 [glove_config] bite_size
+    encoding: gb2312
+    skip_frames: 11              # 老代码丢弃前 11 帧
+
+  # ---- 握力加工参数（A2_analyze_grip 用；老代码里这些值写死在 hand1.py）----
+  grip_process:
+    kalman:
+      process_noise: 0.01
+      measurement_noise: 2.0
+    angle_scale: 10              # 角度 ÷10
+    angle_dead_zone: 0.2         # 绝对值 ≤0.2 记 0
+    pressure_scale: 100          # 压力 ÷100
+    pressure_offset:             # 多项式末项偏移（老代码 L:-28 / R:-51）
+      L: 28
+      R: 51
+
+  # ---- 视频：gstreamer 子进程（已迁移）----
+  video:
+    enabled: false
+    transport: subprocess
+    gst_path: gstreamer/1.0/mingw_x86_64/bin/gst-launch-1.0.exe   # 相对项目根；找不到就用 PATH 里的
+    camera: video1               # 落库用来区分几号机
+    # 当前用摄像头流（= 老代码把 startRTP1 注释掉、强制 startRTP2 的那处改动）
+    cmd: >-
+      -v -e ksvideosrc device-name="Logitech BRIO" ! video/x-raw,width=1280,height=720,framerate=10/1
+      ! videoconvert ! tee name=t t.! queue ! avenc_mpeg4 ! avimux
+      ! filesink location="{video}.avi"
+      t.! queue ! d3dvideosink t.! queue ! jpegenc
+      ! multifilesink location="{frames}/1_pic_%06d.jpg"
+    out_dir: video1              # 帧目录（相对会话结果目录）
+    frame_pattern: 1_pic_%06d.jpg
+    poll_interval: 0.2           # 扫描新帧的间隔（秒）
+    dry_run: false               # true = 不起 gstreamer，只造帧（无硬件测试用）
+
+  # ---- 摄像头：cv2 直读，实时监测 + 可选落盘（界面「表情」页用）----
+  camera:
+    enabled: false               # 界面里点"打开摄像头"时会临时启用，不必默认打开
+    transport: webcam
+    index: 0                     # 0 = 默认摄像头
+    backend: any                 # any / dshow / msmf（Windows 上 dshow 最稳）
+    label: camera1               # 落库 data_video_frame.camera
+    width: 640
+    height: 480
+    fps: 8                       # 每秒取几帧（监测够用；调大更"实时"但吃 CPU）
+    warmup: 5                    # 丢掉前几帧（有些驱动开头全黑）
+    out_dir: camera1             # 帧目录（相对会话结果目录）
+    frame_pattern: cam1_%06d.jpg
+    save_frames: true            # true=帧落盘并进 data_video_frame；false=只监测不落盘
+    save_every: 1
+    dark_threshold: 3.0          # 画面均值低于此值标记为"全黑"（界面提示用）
+
+  # ---- GPU/推理节点通信：TCP 双向（待迁移）----
+  gpu:
+    enabled: false
+    transport: tcp
+    peer_ip: 127.0.0.1           # 老 [data_gpu_win] peer_ip
+    protocol: TCP
+    ports:
+      reasoning: 19901           # 老 peer_receive_port
+      serial_422: 8002           # 老 peer_422_port
+      ble: 8003                  # 老 peer_ble_port
+      photo: 8004                # 老 peer_photo_port
+
+  # ---- 异常预警：TCP 收指标 + 播报警音（待迁移）----
+  alert:
+    enabled: false
+    transport: tcp_server
+    bind: 127.0.0.1              # 老 [data_alert_win] tcpserver_ip
+    port: 8888                   # 老 [data_alert_win] tcpserver_port
+    audio_dir: 异常状态预警音
+
+  # ---- 采集卡主机控制：SSH（待迁移）----
+  ctrl:
+    enabled: false
+    transport: ssh
+    host: 192.168.1.179          # 老 [collect] ip
+    port: 22
+    user: rock                   # 老代码里硬编码 rock/rock，这里提到配置里
+    password: rock
+
+# ---- A2 分析层参数（老代码把这些值写在函数默认参数里、模型路径写死在代码里）----
+analyze:
+  models_dir: models             # 相对工程根：AAA_HcpsApp/models（自老工程 saved_models 拷来）
+  models: [SVM, CatBoost, XGBoost]   # 老 load_assessment 的 default_models
+  # 10 维负荷特征，顺序 = 喂给 scaler 的顺序，别改
+  feature_columns: [pupil, blink_rate, bpm, hf, lf/hf, lf, vlf, sd2/sd1, rmssd, sd1]
+  timestamp_column: timestamp
+  ecg:
+    sample_rate: 240             # 老 get_feature 的 Sample_rate
+    window_size: 60              # 老 windows_size（秒）
+    overlap: 0.8                 # 老 overlap_rate
+    drop_columns: [sdnn, sd2]    # 老代码返回前删掉的两列
+  eye:
+    window_size: 60              # 老 windows_size（秒）
+    overlap: 0.8                 # 老 overlap_rate
+  face:                          # 表情识别（A2_analyze_face，需要 tensorflow）
+    model_weights: cnn3_best_weights.h5   # 相对 models_dir
+    detector: blazeface          # blazeface / haar（haar 用 cv2 自带的级联）
+    detector_model: front        # 只搬了正脸模型；侧向/后置（back）先没搬
+    score_threshold: 0.7         # 老代码 blaze_detect 的默认阈值
+    iou_threshold: 0.3
+    img_size: 48                 # CNN3 输入尺寸
+    augment: true                # 老代码每张脸做 6 张增广再求和
+    step: 1                      # 每 step 帧识别一帧（逐帧识别慢，抽样时调大）
+  output_dir: analyze_result     # 分析结果 csv 落盘目录（相对会话结果目录）

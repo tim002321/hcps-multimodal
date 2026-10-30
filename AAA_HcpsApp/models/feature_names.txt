@@ -1,0 +1,10 @@
+pupil
+blink_rate
+bpm
+hf
+lf/hf
+lf
+vlf
+sd2/sd1
+rmssd
+sd1

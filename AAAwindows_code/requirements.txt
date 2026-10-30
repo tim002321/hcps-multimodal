@@ -1,0 +1,5 @@
+bleak>=0.21.0
+# 可视化界面（run_monitor.py）
+PyQt5==5.15.11
+pyqtgraph>=0.13
+numpy>=1.24
