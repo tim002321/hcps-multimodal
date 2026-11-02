@@ -83,6 +83,22 @@ class Config:
     flush_interval: float = 0.5
     data_dir: str = DATA_DIR
 
+    # ---- 界面 ----
+    # 字号倍率：1.0 = 原始设计值。高 DPI 屏由 Qt 自动缩放，
+    # 这里只在"还想再大一点"时叠加（1.15 / 1.3 比较常用）。
+    ui_scale: float = 1.0
+
+    # ---- 摄像头实时打哈欠检测 ----
+    # 见 vision/ 包与 docs：默认关闭，勾选后才加载模型（首次约 2~5 秒）
+    vision_enabled: bool = True         # 摄像头页默认启用打哈欠检测
+    vision_interval: float = 0.15        # 推理间隔（秒），约 6~7fps
+    vision_threshold: float = 0.5        # 张嘴概率阈值，必须用本地素材标定
+    vision_yawn_min_sec: float = 1.5     # 连续张嘴多久算一次哈欠
+    vision_cooldown_sec: float = 5.0     # 一次哈欠后的冷却
+    vision_dip_grace: float = 0.3        # 概率瞬时跌落的容忍窗口（秒），防抖动打断判定
+    vision_backend: str = 'auto'         # auto / torch / onnx
+    vision_face_conf: float = 0.35       # 人脸检测置信度阈值
+
     # ------------------------------------------------------------------
     @classmethod
     def load(cls, path: Optional[str] = None) -> 'Config':
@@ -120,6 +136,17 @@ class Config:
             commit_interval=cp.getfloat('storage', 'commit_interval', fallback=0.5),
             commit_rows=cp.getint('storage', 'commit_rows', fallback=500),
             flush_interval=cp.getfloat('storage', 'flush_interval', fallback=0.5),
+
+            ui_scale=cp.getfloat('ui', 'scale', fallback=1.0),
+
+            vision_enabled=cp.getboolean('vision', 'enabled', fallback=True),
+            vision_interval=cp.getfloat('vision', 'interval', fallback=0.15),
+            vision_threshold=cp.getfloat('vision', 'threshold', fallback=0.5),
+            vision_yawn_min_sec=cp.getfloat('vision', 'yawn_min_sec', fallback=1.5),
+            vision_cooldown_sec=cp.getfloat('vision', 'cooldown_sec', fallback=5.0),
+            vision_dip_grace=cp.getfloat('vision', 'dip_grace', fallback=0.3),
+            vision_backend=get('vision', 'backend') or 'auto',
+            vision_face_conf=cp.getfloat('vision', 'face_conf', fallback=0.35),
         )
 
     # ------------------------------------------------------------------

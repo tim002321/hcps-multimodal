@@ -36,6 +36,39 @@ BRACELET_BATTERY_TABLE = "bracelet_battery"       # 电量，每次上报一行 
 DEFAULT_COMMIT_INTERVAL = 0.5   # 秒：距上次提交超过该时间就提交一次
 DEFAULT_COMMIT_ROWS = 500       # 行：累计新增行数达到该值就提交一次
 
+# 一个库在磁盘上可能由多个文件组成：主库 + 预写日志 + 共享内存 + 回滚日志
+# （删除时要一起清掉；算体积时只看前两个：-shm 是内存索引的映像，不含数据）
+DB_SUFFIXES = ('', '-wal', '-shm', '-journal')
+DB_SIZE_SUFFIXES = ('', '-wal')
+# SQLite 文件头占一页；WAL 模式建完库、还没写任何数据时文件就是这么大
+EMPTY_DB_BYTES = 4096
+
+
+def db_total_size(path):
+    """库文件连同 -wal 的总字节数（不含 -shm，那只是共享内存的落盘映像）。
+
+    WAL 模式下已提交的数据可能仍留在 -wal 里、没 checkpoint 回主库，
+    只看主库会把正在采集或异常退出的会话显示成 0 MB。
+    """
+    total = 0
+    for suffix in DB_SIZE_SUFFIXES:
+        try:
+            total += os.path.getsize(path + suffix)
+        except OSError:
+            pass
+    return total
+
+
+def is_empty_db(path):
+    """是否是「只有文件头、一张表都没有」的空库。
+
+    只做尺寸判断：写过任何一张表，SQLite 至少要再加一页（8192 字节），
+    所以「主库 + -wal 合计 ≤ 一页」等价于「没有任何表和数据」，
+    而且不用打开文件——以只读方式打开 WAL 库会顺带生成 -shm，
+    扫描目录时不该产生这种副作用。
+    """
+    return db_total_size(path) <= EMPTY_DB_BYTES
+
 
 def now_str():
     """返回当前系统时间字符串，作为数据的写入时间。"""
@@ -55,15 +88,22 @@ class SensorDB:
                  session_subdir=None):
         """`session_subdir` 用于「组别/人物名_实验时间」这种分层存放，
         例如 session_subdir='A组/张三_20261024_160000' 会建到
-        `data/A组/张三_20261024_160000/<时间戳>.db`。"""
+        `data/A组/张三_20261024_160000/<时间戳>.db`。
+
+        注意：**构造本对象不会在磁盘上留下任何文件**。
+        `sqlite3.connect()` 加上 `PRAGMA journal_mode=WAL` 会立刻写出 4096 字节的
+        文件头，即「零张表的空库」——程序每次启动都建一个、没采到数据就退出，
+        会话列表里于是堆满 0.0 MB 的条目。所以连接推迟到第一次真正写入时才建立，
+        连会话目录也在那时才创建。
+        """
         self.data_dir = data_dir
         if session_subdir:
             data_dir = os.path.join(data_dir, *str(session_subdir).replace('\\', '/').split('/'))
-        os.makedirs(data_dir, exist_ok=True)
+        self.session_dir = data_dir          # 首次写入时才 makedirs
 
         if db_name is None:
             db_name = datetime.now().strftime("%Y%m%d_%H%M%S") + ".db"
-        self.db_path = os.path.join(data_dir, db_name)
+        self.db_path = os.path.join(self.session_dir, db_name)
 
         # 若同名文件已存在（如同一秒内重复启动），自动追加序号，避免覆盖旧数据
         base, ext = os.path.splitext(self.db_path)
@@ -78,14 +118,35 @@ class SensorDB:
         self._pending_rows = 0
         self._last_commit = time.time()
 
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        # WAL 下 synchronous=NORMAL 已可保证进程崩溃不损坏数据库，且 fsync 次数大幅减少
-        self.conn.execute("PRAGMA synchronous=NORMAL;")
-        self.conn.execute("PRAGMA busy_timeout=5000;")   # 摄像头帧写入同一个库时避免短暂 locked
+        self._conn = None                    # 懒连接：首次写入才建库
 
-    def _ensure_table(self, table):
-        self.conn.execute(
+    # ------------------------------------------------------------------
+    # 连接管理
+    # ------------------------------------------------------------------
+    @property
+    def conn(self):
+        """当前连接（不存在则先建库，兼容旧调用方式）。"""
+        return self._connect()
+
+    @property
+    def created(self) -> bool:
+        """是否已真正落盘。没有数据时始终为 False。"""
+        return self._conn is not None
+
+    def _connect(self):
+        """首次调用时建目录、建库、设 PRAGMA；之后直接复用。"""
+        if self._conn is None:
+            os.makedirs(self.session_dir, exist_ok=True)
+            conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            # WAL 下 synchronous=NORMAL 已可保证进程崩溃不损坏数据库，且 fsync 次数大幅减少
+            conn.execute("PRAGMA synchronous=NORMAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")   # 摄像头帧写入同一个库时避免短暂 locked
+            self._conn = conn
+        return self._conn
+
+    def _ensure_table(self, conn, table):
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS {} (time TEXT, value TEXT)".format(table)
         )
 
@@ -105,18 +166,19 @@ class SensorDB:
 
     def commit(self):
         """显式提交当前事务。"""
-        if self._pending_rows == 0:
+        if self._conn is None or self._pending_rows == 0:
             self._last_commit = time.time()
             return
-        self.conn.commit()
+        self._conn.commit()
         self._pending_rows = 0
         self._last_commit = time.time()
 
     def insert(self, table, value, ts=None):
         """写入单条记录。value 为标量或 dict/list。"""
         ts = ts or now_str()
-        self._ensure_table(table)
-        self.conn.execute(
+        conn = self._connect()               # 第一次写入才真正建库
+        self._ensure_table(conn, table)
+        conn.execute(
             "INSERT INTO {} (time, value) VALUES (?, ?)".format(table),
             (ts, self._encode(value)),
         )
@@ -128,21 +190,25 @@ class SensorDB:
         if not values:
             return
         ts = ts or now_str()
-        self._ensure_table(table)
+        conn = self._connect()               # 第一次写入才真正建库
+        self._ensure_table(conn, table)
         rows = [(ts, self._encode(v)) for v in values]
-        self.conn.executemany(
+        conn.executemany(
             "INSERT INTO {} (time, value) VALUES (?, ?)".format(table), rows
         )
         self._pending_rows += len(rows)
         self._maybe_commit()
 
     def close(self):
-        """提交并关闭数据库连接。"""
+        """提交并关闭数据库连接；从未写入过则不做任何事（也不会建文件）。"""
+        if self._conn is None:
+            return
         try:
-            self.conn.commit()
-            self.conn.close()
+            self._conn.commit()
+            self._conn.close()
         except Exception:
             pass
+        self._conn = None
 
 
 class DataRecorder:

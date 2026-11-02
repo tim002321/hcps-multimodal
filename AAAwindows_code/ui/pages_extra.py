@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
+import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -20,15 +22,19 @@ from analysis.features import analyze_packets
 from core.config import DATA_DIR, Config
 from ui import theme
 from ui.base import BasePage
-from ui.replay import list_sessions, load_packets
-from ui.widgets import Card, SectionBar, StatTile, label, mono, pill
+from ui.replay import format_size, list_sessions, load_packets, load_yawn_events
+from ui.widgets import Card, StatTile, label, mono
 
 
 # ---------------------------------------------------------------------------
 # 预留设备页
 # ---------------------------------------------------------------------------
 class ReservedDevicePage(BasePage):
-    """尚未接入的设备：把「接进来要做什么」写在页面上，避免下次又要翻文档。"""
+    """尚未接入的设备页。
+
+    界面上只显示「未接入」这一个状态，不放开发说明——那些属于接入时看的材料，
+    留在下面的 CHECKLIST 和 docs/ 里，不占用户视线。
+    """
 
     DEVICE_KEY = ''
     ENV_FLAG = ''
@@ -37,30 +43,9 @@ class ReservedDevicePage(BasePage):
     def build(self) -> None:
         cfg = Config.load()
         enabled = bool(getattr(cfg, self.ENV_FLAG, False))
-
-        head = QHBoxLayout()
-        head.addWidget(label(self.title, 'PageTitle'))
-        head.addStretch(1)
-        head.addWidget(pill('已接入' if enabled else '预留', theme.PALETTE['green'] if enabled
-                            else theme.PALETTE['text_dim'], '#F7F7F7',
-                            theme.PALETTE['green'] if enabled else '#B0B0B0'))
-        self.content.addLayout(head)
-        self.content.addWidget(label(self.subtitle, 'PageDesc'))
-
-        card = Card('接入清单')
-        for index, item in enumerate(self.CHECKLIST, 1):
-            line = label(f'{index}. {item}', 'PageDesc')
-            line.setWordWrap(True)
-            card.add(line)
-        self.content.addWidget(card)
-
-        cfg_card = Card('相关配置（config.ini）')
-        for name, value in self.config_items(cfg):
-            row = QHBoxLayout()
-            row.addWidget(mono(name), 0)
-            row.addWidget(label(str(value), 'PageDesc'), 1)
-            cfg_card.add_layout(row)
-        self.content.addWidget(cfg_card)
+        tip = QLabel('该设备已启用' if enabled else '未接入该设备')
+        tip.setStyleSheet('color: #777777; padding: 14px 2px;')
+        self.content.addWidget(tip)
         self.content.addStretch(1)
 
     def config_items(self, cfg: Config) -> List[Tuple[str, Any]]:
@@ -69,10 +54,10 @@ class ReservedDevicePage(BasePage):
 
 class EmgPage(ReservedDevicePage):
     title = '表面肌电'
-    subtitle = ('预留：走 LSL 流（与主工程 data_emg.py 同一路），接入后这里显示原始肌电、'
-                'RMS 包络与中值频率。')
+    subtitle = ''
     DEVICE_KEY = 'emg'
     ENV_FLAG = 'emg_enabled'
+    # 接入步骤留在代码里备查，不再显示到界面上
     CHECKLIST = [
         'devices/emg_receiver.py 里把 start_emg() 接到 pylsl 的 StreamInlet（骨架已写好）',
         'core/db_storage.py 增加 data_emg 表（主工程 com/db.py 里已有同名字段可参照）',
@@ -86,8 +71,7 @@ class EmgPage(ReservedDevicePage):
 
 class EyePage(ReservedDevicePage):
     title = '眼动仪'
-    subtitle = ('预留：走 UDP + SmartEye 二进制解包（与主工程 data_udp.py 同一套协议），'
-                '接入后这里显示注视点、瞳孔直径与眨眼。')
+    subtitle = ''
     DEVICE_KEY = 'eye'
     ENV_FLAG = 'eye_enabled'
     CHECKLIST = [
@@ -108,29 +92,23 @@ class RecognizePage(BasePage):
     """四个模型的结果面板。模型没接入时明确写「未接入」，不拿假数据糊弄。"""
 
     title = '状态识别'
-    subtitle = '四个模型的结果汇总；实时数据与模型结果按「总线 IP」上传'
+    subtitle = ''
 
     MODELS = [
-        ('load', '负荷等级', '低 / 中 / 高', '10 维特征 → SVM / CatBoost / XGBoost'),
-        ('emotion', '情绪状态', '正性 / 中性 / 负性', 'YOLO 表情 → 情绪映射'),
-        ('fatigue', '疲劳程度', '清醒 / 轻度 / 重度', 'HRV + 眨眼频率 + 表情'),
-        ('attention', '注意水平', '专注 / 分心', '眼动注视 + 头动'),
+        ('load', '负荷等级', '低 / 中 / 高'),
+        ('emotion', '情绪状态', '正性 / 中性 / 负性'),
+        ('fatigue', '疲劳程度', '清醒 / 轻度 / 重度'),
+        ('attention', '注意水平', '专注 / 分心'),
     ]
 
     def build(self) -> None:
         cfg = Config.load()
-        head = QHBoxLayout()
-        head.addWidget(label(self.title, 'PageTitle'))
-        head.addStretch(1)
-        head.addWidget(pill('模型未接入', theme.PALETTE['amber'], '#FFF7E6', theme.PALETTE['amber']))
-        self.content.addLayout(head)
-        self.content.addWidget(label(self.subtitle, 'PageDesc'))
 
         tiles = QHBoxLayout()
         tiles.setSpacing(8)
         self.tiles: Dict[str, StatTile] = {}
-        for key, name, levels, note in self.MODELS:
-            tile = StatTile(name, '', '--', theme.PALETTE['text_dim'], note)
+        for key, name, _levels in self.MODELS:
+            tile = StatTile(name, '', '--', theme.PALETTE['text_dim'])
             self.tiles[key] = tile
             tiles.addWidget(tile, 1)
         self.content.addLayout(tiles)
@@ -147,28 +125,27 @@ class RecognizePage(BasePage):
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setRowCount(len(self.MODELS))
-        for row, (_key, name, levels, note) in enumerate(self.MODELS):
+        for row, (_key, name, levels) in enumerate(self.MODELS):
             self.table.setItem(row, 0, QTableWidgetItem(name))
             self.table.setItem(row, 1, QTableWidgetItem(levels))
             self.table.setItem(row, 2, QTableWidgetItem('未接入'))
+        # 固定 4 行，给个贴合内容的高度，别让表格被拉伸成一整块空白
+        self.table.setMinimumHeight(theme.scaled(160))
+        self.table.setMaximumHeight(theme.scaled(220))
         detail.add(self.table)
         body.addWidget(detail, 3)
 
         bus = Card('总线上传')
         for name, value in (('地址', f'{cfg.server_host}:{cfg.server_port}'),
-                            ('上行内容', '原始采样摘要 + 四个模型结果'),
-                            ('状态', '未启用（等模型与总线协议确定）')):
+                            ('状态', '未启用')):
             row = QHBoxLayout()
             row.addWidget(label(name, 'Dim'), 0)
             row.addWidget(label(str(value), 'PageDesc'), 1)
             bus.add_layout(row)
-        hint = label('· 地址在 config.ini 的 [server] host / port，登录界面可临时覆盖；\n'
-                     '· 上传协议（帧格式、鉴权）需要先与服务端约定，见 docs/需求拆解.md。',
-                     'CardHint')
-        hint.setWordWrap(True)
-        bus.add(hint)
+        bus.body.addStretch(1)          # 与左侧等高时，内容靠上，不散开
         body.addWidget(bus, 2)
-        self.content.addLayout(body, 1)
+        self.content.addLayout(body)
+        self.content.addStretch(1)
 
     def on_tick(self, snapshot: Dict[str, Any]) -> None:
         # 模型接入后在这里刷新；当前保持 -- 与「未接入」
@@ -186,12 +163,43 @@ class AnalysisPage(BasePage):
     """
 
     title = '数据分析'
-    subtitle = '选择会话与时间段 → 特征提取（HRV / 脉搏；眼动与表情待模型接入）'
+    subtitle = ''
+
+    # (界面名, key)。available=False 的只占位，选中后执行按钮禁用。
+    MODELS = [
+        ('HRV / 脉搏特征', 'hrv', True, '规则计算（bpm / SDNN / RMSSD / LF / HF），不需要模型文件'),
+        ('疲劳 · 打哈欠', 'fatigue', True, '统计录制时实时检测写入的哈欠事件（需开启打哈欠检测）'),
+        ('负荷等级', 'load', False, '未接入：缺少模型权重'),
+        ('情绪状态', 'emotion', False, '未接入：缺少模型权重'),
+        ('注意水平', 'attention', False, '未接入：缺少模型权重'),
+    ]
 
     def build(self) -> None:
         self.packets: List[tuple] = []
         self.bound: Tuple[float, float] = (0.0, 0.0)
         self.last_result: Optional[Dict[str, Any]] = None
+
+        # 分析模型：先把"选哪个"的架子搭起来。
+        # 目前只有 HRV/脉搏特征是真正能算的（纯规则，不需要模型文件）；
+        # 其余四个模型没有权重，选中就明确禁用执行按钮，不做假结果。
+        model_row = QHBoxLayout()
+        model_row.setSpacing(12)
+        model_row.addWidget(label('分析模型', 'Dim'))
+        self.model_boxes: Dict[str, Any] = {}
+        for text, key, available, hint in self.MODELS:
+            box = QCheckBox(text)
+            box.setToolTip(hint)
+            box.setChecked(key == 'hrv')          # 默认只勾真正能算的那个
+            if not available:
+                box.setStyleSheet('color: #8A8A8A;')   # 可见但灰显：表示存在、尚未接入
+            box.stateChanged.connect(self._sync_model)
+            self.model_boxes[key] = box
+            model_row.addWidget(box)
+        model_row.addStretch(1)
+        self.content.addLayout(model_row)
+        self.model_hint = mono('')
+        self.model_hint.setWordWrap(True)
+        self.content.addWidget(self.model_hint)
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
@@ -267,20 +275,12 @@ class AnalysisPage(BasePage):
             self.tiles[key] = tile
             tiles.addWidget(tile, 1)
         side.addLayout(tiles)
-
-        note_card = Card('说明')
-        note = label(
-            '· 心电：HRV（bpm / SDNN / RMSSD / pNN50 / SD1 / SD2 / VLF-LF-HF）；\n'
-            '· 手环：PPG 交流耦合 → 峰值检测 → 脉率与脉间期；\n'
-            '· 眼动、表情：模型未接入，输出 n/a；\n'
-            '· 信号不可用（电极脱落 / 无接触）一律 n/a，不给假数值。', 'PageDesc')
-        note.setWordWrap(True)
-        note_card.add(note)
-        side.addWidget(note_card, 1)
+        side.addStretch(1)
         body.addLayout(side, 2)
         self.content.addLayout(body, 1)
 
         self.refresh_sessions()
+        self._sync_model()
 
     # ------------------------------------------------------------------
     def refresh_sessions(self) -> None:
@@ -288,9 +288,24 @@ class AnalysisPage(BasePage):
         for path, mtime, size in list_sessions(DATA_DIR):
             stamp = datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
             self.session_combo.addItem(
-                f'{os.path.basename(path)}   {stamp}   {size / 1024 / 1024:.1f} MB', path)
+                f'{os.path.basename(path)}   {stamp}   {format_size(size)}', path)
         if self.session_combo.count() == 0:
             self.session_combo.addItem('（data/ 下没有会话文件）', None)
+
+    def _checked_models(self) -> List[Tuple[str, str, bool, str]]:
+        return [spec for spec in self.MODELS if self.model_boxes[spec[1]].isChecked()]
+
+    def _sync_model(self) -> None:
+        if not hasattr(self, 'extract_button'):       # 建界面过程中信号会先到
+            return
+        checked = self._checked_models()
+        if not checked:
+            self.model_hint.setText('至少勾选一个模型')
+            self.extract_button.setEnabled(False)
+            return
+        names = [spec[0] if spec[2] else spec[0] + '（未接入）' for spec in checked]
+        self.model_hint.setText('已选：' + '、'.join(names))
+        self.extract_button.setEnabled(any(spec[2] for spec in checked))
 
     def _sync_range_enabled(self) -> None:
         enabled = self.use_range.isChecked()
@@ -316,6 +331,33 @@ class AnalysisPage(BasePage):
             len(self.packets), max(0.0, last - first)))
         self.run_analysis()               # 载入即先跑一遍全区间，省一次点击
 
+    def adopt_selection(self) -> None:
+        """由回放页「进入分析」调用：带着会话路径和选区过来，直接出结果。"""
+        bridge = getattr(self.window_ref, 'review_selection', None)
+        if not bridge or not bridge.get('path'):
+            return
+        path = bridge['path']
+        self.refresh_sessions()
+        index = self.session_combo.findData(path)
+        if index < 0:                       # 会话可能在别的目录，补一项
+            self.session_combo.addItem('{}（来自回放）'.format(os.path.basename(path)), path)
+            index = self.session_combo.count() - 1
+        self.session_combo.setCurrentIndex(index)
+
+        self.packets = load_packets(path)
+        if not self.packets:
+            self.range_hint.setText('该会话没有可用数据')
+            return
+        first, last = self.packets[0][0], self.packets[-1][0]
+        self.bound = (first, last)
+        self.use_range.setChecked(True)
+        self.start_edit.setDateTime(QDateTime.fromSecsSinceEpoch(int(bridge['start'])))
+        self.end_edit.setDateTime(QDateTime.fromSecsSinceEpoch(int(bridge['end'])))
+        self._sync_range_enabled()
+        self.range_hint.setText('来自回放选区 · 共 {:.1f} 秒'.format(
+            max(0.0, bridge['end'] - bridge['start'])))
+        self.run_analysis()
+
     def _selected_range(self) -> Tuple[Optional[float], Optional[float]]:
         if not self.use_range.isChecked() or not self.packets:
             return None, None
@@ -327,27 +369,89 @@ class AnalysisPage(BasePage):
 
     # ------------------------------------------------------------------
     def run_analysis(self) -> None:
-        if not self.packets:
+        """按勾选的模型逐个跑，结果按块拼进同一张表。"""
+        checked = self._checked_models()
+        if not checked:
+            self.range_hint.setText('至少勾选一个分析模型')
+            return
+        # 只有 HRV 需要载入采样包；疲劳模型读的是事件表，不该被这个门槛挡住
+        if any(spec[1] == 'hrv' for spec in checked) and not self.packets:
             self.load_selected()
             if not self.packets:
                 return
         start, end = self._selected_range()
-        result = analyze_packets(self.packets, start, end)
-        self.last_result = result
-        self._render(result)
 
-    def _render(self, result: Dict[str, Any]) -> None:
+        rows: List[Tuple[str, str, str]] = []
+        for text, key, available, hint in checked:
+            if key == 'hrv' and available:
+                result = analyze_packets(self.packets, start, end)
+                self.last_result = result
+                rows.extend(self._hrv_rows(result))
+            elif key == 'fatigue' and available:
+                rows.extend(self._fatigue_rows(start, end))
+            else:
+                rows.append(('【{}】'.format(text), '未接入', hint))
+        self._fill_rows(rows)
+        self.export_button.setEnabled(bool(self.last_result))
+        if rows:                       # 真的产出了结果才算"分析完成"
+            mark = getattr(self.window_ref, 'mark_stage_done', None)
+            if callable(mark):
+                mark(2)
+
+    def reset_results(self) -> None:
+        """回退到回放段重新选段时，把上一次的结果清掉，避免看起来还有效。"""
+        self.result_table.setRowCount(0)
+        self.last_result = None
+        self.packets = []
+        self.export_button.setEnabled(False)
+        self.range_hint.setText('尚未载入会话')
+
+    def _hrv_rows(self, result: Dict[str, Any]) -> List[Tuple[str, str, str]]:
         span = result['区间'][2]
-        rows: List[Tuple[str, str, str]] = [
-            ('分析时长', f'{span:.1f} 秒', '选定区间'),
-        ]
+        rows: List[Tuple[str, str, str]] = [('分析时长', '{:.1f} 秒'.format(span), '选定区间')]
         for section in ('心电', '手环PPG', '眼动', '表情'):
             block = result.get(section) or {}
-            status = block.get('状态', 'n/a')
-            rows.append((f'【{section}】', status, block.get('说明', '')))
+            rows.append(('【{}】'.format(section), block.get('状态', 'n/a'),
+                         block.get('说明', '')))
             for name, value in (block.get('特征') or {}).items():
-                rows.append((f'    {name}', 'n/a' if value is None else str(value), ''))
+                rows.append(('    {}'.format(name),
+                             'n/a' if value is None else str(value), ''))
+        ecg = (result.get('心电') or {}).get('特征') or {}
+        ppg = (result.get('手环PPG') or {}).get('特征') or {}
+        self.tiles['hr'].set_value(str(ecg.get('bpm', '--')))
+        self.tiles['pulse'].set_value(str(ppg.get('脉率', '--')))
+        self.tiles['sdnn'].set_value(str(ecg.get('sdnn', '--')))
+        self.tiles['lf_hf'].set_value(str(ecg.get('lf/hf', '--')))
+        return rows
 
+    def _fatigue_rows(self, start, end) -> List[Tuple[str, str, str]]:
+        """疲劳模型：读会话库里的 yawn_events —— 录制时由实时检测写入的事件。"""
+        path = self.session_combo.currentData()
+        rows: List[Tuple[str, str, str]] = [('【疲劳 · 打哈欠】', '', '')]
+        if not path:
+            rows.append(('    哈欠次数', 'n/a', '没有可用的会话'))
+            return rows
+        events = load_yawn_events(path, start, end)
+        if events is None:
+            rows.append(('    哈欠次数', 'n/a',
+                         '该会话没有打哈欠记录（录制时未启用检测，或是旧版本录的）'))
+            return rows
+        span = (end - start) if (start and end) else 0.0
+        if span <= 0 and len(events) >= 2:      # 没选区间时用首末事件估跨度
+            span = float(events[-1].get('time', 0)) - float(events[0].get('time', 0))
+        count = len(events)
+        per_min = (count * 60.0 / span) if span > 5 else None
+        longest = max((item.get('duration') or 0.0 for item in events), default=0.0)
+        rows.append(('    哈欠次数', str(count), '区间内累计'))
+        rows.append(('    每分钟次数', 'n/a' if per_min is None else '{:.2f}'.format(per_min),
+                     '区间不足 5 秒不计算'))
+        rows.append(('    最长张口', '{:.1f} 秒'.format(longest), '单次张嘴持续时长'))
+        level = ('重度疲劳（参考）' if count >= 4 else
+                 '轻度疲劳（参考）' if count >= 2 else '正常（参考）')
+        rows.append(('    疲劳分级', level, '按次数分档，阈值待标定'))
+        return rows
+
+    def _fill_rows(self, rows: List[Tuple[str, str, str]]) -> None:
         self.result_table.setRowCount(len(rows))
         for index, (name, value, note) in enumerate(rows):
             self.result_table.setItem(index, 0, QTableWidgetItem(name))
@@ -356,14 +460,6 @@ class AnalysisPage(BasePage):
                 value_item.setForeground(Qt.darkGray)
             self.result_table.setItem(index, 1, value_item)
             self.result_table.setItem(index, 2, QTableWidgetItem(note))
-
-        ecg = (result.get('心电') or {}).get('特征') or {}
-        ppg = (result.get('手环PPG') or {}).get('特征') or {}
-        self.tiles['hr'].set_value(str(ecg.get('bpm', '--')))
-        self.tiles['pulse'].set_value(str(ppg.get('脉率', '--')))
-        self.tiles['sdnn'].set_value(str(ecg.get('sdnn', '--')))
-        self.tiles['lf_hf'].set_value(str(ecg.get('lf/hf', '--')))
-        self.export_button.setEnabled(True)
 
     def export_csv(self) -> None:
         if not self.last_result:

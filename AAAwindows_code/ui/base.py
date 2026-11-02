@@ -75,6 +75,9 @@ class BasePage(QWidget):
     def build(self) -> None:
         """子类搭页面。"""
 
+    def on_show(self) -> None:
+        """切到本页所在阶段时调用一次（可选覆盖）。"""
+
     def on_data(self, snapshot: Dict[str, Any]) -> None:
         """约 25 帧/秒（40ms）。"""
 
@@ -125,7 +128,7 @@ class ChannelGridPage(BasePage):
             [(channel['key'], channel['title'], channel.get('unit', ''))
              for channel in self.CHANNELS],
             self.DEFAULT_SELECTED, '曲线显示参数')
-        self.param_panel.setFixedWidth(236)
+        self.param_panel.setFixedWidth(theme.scaled(236))
         self.param_panel.changed.connect(self._rebuild_charts)
         body.addWidget(self.param_panel, 0)
         self.content.addLayout(body, 1)

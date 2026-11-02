@@ -26,6 +26,30 @@ import threading
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
+
+def _preload_vision_runtime() -> None:
+    """在任何其他第三方包之前，把视觉推理的原生依赖加载好。
+
+    这不是提速，是躲一个必崩的坑：torch / ultralytics / onnxruntime 各自带了
+    一份 OpenMP、protobuf、abseil 原生库，如果 OpenCV 或 Qt 先把进程的 DLL
+    状态立起来、之后才导入它们，Windows 下会直接段错误（实测退出码 139，
+    Python 层抓不到异常，界面直接消失，连 traceback 都没有）。
+
+    实测规律：只要这三者在 cv2 / PyQt5 之前导入就稳定；放在后面，
+    崩溃点固定在 `onnxruntime/capi/_pybind_state.py` 加载 DLL 的那一行。
+    所以这段必须放在文件最前面，`core.preflight`（会 import cv2/PyQt5）之前。
+
+    未安装这些包时静默跳过 —— 打哈欠检测是可选功能，缺了不影响采集。
+    """
+    try:
+        from vision.yawn_monitor import _preload_heavy_modules
+        _preload_heavy_modules()
+    except Exception:                                     # noqa: BLE001 - 可选功能，不阻断启动
+        pass
+
+
+_preload_vision_runtime()
+
 from core.preflight import check_dependencies
 
 check_dependencies(need_ui=True)          # 缺 PyQt5 等依赖时给出明确指引，不再甩 traceback
@@ -39,6 +63,7 @@ from core.writer_thread import SensorWriter
 from devices.bracelet_receiver import start_bracelet
 from devices.ecg_receiver import PacketOutput, start_receiver
 from ui.buffers import LiveBuffers, MonitorRecorder
+from ui import theme
 from ui.profile import ProfileDialog
 from ui.window import MonitorWindow, create_app
 
@@ -130,6 +155,9 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument('--debug', action='store_true', help='打印 BLE 服务/特征表')
     parser.add_argument('--no-profile', action='store_true',
                         help='跳过登录/被试信息录入（自动跑、截图自检时用）')
+    parser.add_argument('--ui-scale', type=float, default=None,
+                        help='界面字号倍率（1.0 = 默认；觉得字还小就试 1.15 / 1.3）。'
+                             '也可用环境变量 HCP_UI_SCALE')
     return parser.parse_args(argv)
 
 
@@ -158,6 +186,19 @@ def main(argv: Optional[list] = None) -> int:
     buffers = LiveBuffers()
     status = DeviceStatus()
 
+    # 字号倍率：必须在建 QApplication / 任何对话框之前定下来（theme.QSS 会被重建）。
+    # 优先级：命令行 --ui-scale > 环境变量 HCP_UI_SCALE > config.ini [ui] scale
+    scale = args.ui_scale
+    if scale is None and os.environ.get('HCP_UI_SCALE'):
+        try:
+            scale = float(os.environ['HCP_UI_SCALE'])
+        except ValueError:
+            print('[界面] 环境变量 HCP_UI_SCALE 不是数字，已忽略', flush=True)
+    if scale is None:
+        scale = cfg.ui_scale
+    if scale and abs(scale - 1.0) > 1e-6:
+        print('[界面] 字号倍率 {}'.format(theme.set_scale(scale)), flush=True)
+
     # 必须先建 QApplication，再碰任何 QWidget。
     # Qt 里"没有 QApplication 就创建 QWidget"是 qFatal → abort()，
     # Windows 上表现为进程直接崩掉、退出码 0xC0000409（STATUS_STACK_BUFFER_OVERRUN），
@@ -166,7 +207,9 @@ def main(argv: Optional[list] = None) -> int:
 
     # 再录被试信息：人物名/组别/实验时间决定会话目录 data/<组别>/<人物名>_<时间>/
     profile = None if args.no_profile else ProfileDialog.collect(cfg)
-    session_subdir = profile.session_subdir() if profile else None
+    # 启动时选了「直接查看历史」：不连蓝牙、不建会话目录，直接跳回放页。
+    review_only = bool(profile and profile.reviewing and not args.replay)
+    session_subdir = profile.session_subdir() if (profile and not review_only) else None
 
     storage = SensorDB(commit_interval=cfg.commit_interval, commit_rows=cfg.commit_rows,
                        session_subdir=session_subdir)
@@ -203,19 +246,30 @@ def main(argv: Optional[list] = None) -> int:
         buffers,
         session_info={
             'db_path': storage.db_path,
-            'source': '回放' if args.replay else ('仅界面' if args.no_ble else '实时蓝牙'),
+            'source': ('回看历史' if review_only else
+                       ('回放' if args.replay else ('仅界面' if args.no_ble else '实时蓝牙'))),
             'subject': '{} / {}'.format(profile.name, profile.group) if profile else '临时会话',
             'server': '{}:{}'.format(profile.server_host, cfg.server_port) if profile
                       else '{}:{}'.format(cfg.server_host, cfg.server_port),
+            # 启动时勾的测量工具决定注册哪些页面；没勾就不出现在导航里
+            'devices': tuple(profile.devices) if profile else ('ecg', 'bracelet', 'camera'),
+            'review_only': review_only,
         },
         writer=writer,
         status=status,
         ble_start=None if args.no_ble else start_ble,
         ble_stop=None if args.no_ble else stop_ble,
+        config=cfg,
     )
     window.show()
 
-    if args.replay:
+    if review_only:
+        window.enter_review_mode()
+        print('[界面] 直接查看历史：已跳到「回放与选段」，不会新建会话库', flush=True)
+    elif args.replay:
+        # 命令行直接回放：先把流程推进到第②段，否则文件在播、界面却停在采集段
+        window.mark_stage_done(0)
+        window.goto_stage(1, force=True)
         count = window.start_replay(args.replay, args.speed)
         print('[界面] 回放 {} 个包：{}'.format(count, args.replay), flush=True)
     elif args.auto_connect and not args.no_ble:

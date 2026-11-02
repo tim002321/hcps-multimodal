@@ -28,7 +28,7 @@ import numpy as np                                                    # noqa: E4
 from ui.buffers import (ECG_RATE, LiveBuffers, ecg_signal_quality,     # noqa: E402
                         estimate_heart_rate)
 from ui.replay import list_sessions, load_packets                     # noqa: E402
-from ui.window import MonitorWindow, create_app                       # noqa: E402
+from ui.window import STAGE_SPECS, MonitorWindow, create_app          # noqa: E402
 
 
 class FakeCamera:
@@ -78,23 +78,48 @@ def pump(app, seconds: float) -> None:
         time.sleep(0.02)
 
 
-def pick_database(explicit: str = '') -> str:
-    """优先挑带手环表的库（这样三页都有内容）。"""
+def pick_database(explicit: str = '', seconds: float = 15.0) -> str:
+    """挑一个前 `seconds` 秒里**心电和手环都有数据**的库。
+
+    只看"有没有表"是不够的：有的会话手环比心电晚一分钟才连上，
+    回放前 40 秒里 PPG / GSR 全是空的，冒烟断言会误报失败。
+    """
     if explicit:
         return explicit
     candidates = [path for path, _mtime, _size in list_sessions(str(ROOT / 'data'))
                   if path.endswith('.db')]
+    import sqlite3
+
+    scored = []
     for path in candidates:
         try:
-            import sqlite3
             conn = sqlite3.connect(f'file:{path}?mode=ro', uri=True)
+        except sqlite3.Error:
+            continue
+        try:
             tables = {row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'")}
-            conn.close()
-        except Exception:                             # noqa: BLE001
+            if 'bracelet_ppg_data' not in tables or 'ecg_data' not in tables:
+                continue
+            start = conn.execute('SELECT MIN(time) FROM ecg_data').fetchone()[0]
+            if not start:
+                continue
+            ppg = conn.execute(
+                'SELECT COUNT(*) FROM bracelet_ppg_data WHERE time <= datetime(?, ?)',
+                (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
+            gsr = 0
+            if 'bracelet_gsr_data' in tables:
+                gsr = conn.execute(
+                    'SELECT COUNT(*) FROM bracelet_gsr_data WHERE time <= datetime(?, ?)',
+                    (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
+            scored.append((ppg + gsr, path))
+        except sqlite3.Error:
             continue
-        if 'bracelet_ppg_data' in tables and 'ecg_data' in tables:
-            return path
+        finally:
+            conn.close()
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
     return candidates[0] if candidates else ''
 
 
@@ -107,6 +132,7 @@ def main() -> int:
     parser.add_argument('--height', type=int, default=940)
     args = parser.parse_args()
 
+    # 冒烟只 pump 4 秒 × 3 倍速 ≈ 12 秒的真实数据，按这个窗口挑库
     db_path = pick_database(args.db)
     if not db_path or not os.path.exists(db_path):
         print('[失败] 找不到可回放的库，请用 --db 指定')
@@ -148,14 +174,26 @@ def main() -> int:
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     shots = []
-    # 页面数量随导航变化（采集 6 项 + 数据查看/状态识别/数据分析），按实际列表遍历
-    for index, page in enumerate(window.pages):
-        window.switch_page(index)
+    # 三段式流程：先按阶段截，采集段再按标签页逐个截。
+    # force=True 是必需的：正常情况下没完成采集进不了②③，但截图要把所有界面都拍到。
+    for stage in range(len(STAGE_SPECS)):
+        window.goto_stage(stage, force=True)
         pump(app, 0.4)
-        path = out_dir / f'{index + 1}_{page.title}.png'
-        window.grab().save(str(path))
-        shots.append(path)
-        print(f'已保存 {path}')
+        if stage == 0:
+            for index in range(window.acq_tabs.count()):
+                window.acq_tabs.setCurrentIndex(index)
+                pump(app, 0.4)
+                page = window.acq_tabs.widget(index)
+                title = getattr(page, 'title', window.acq_tabs.tabText(index))
+                path = out_dir / f'1_{index + 1}_{title}.png'
+                window.grab().save(str(path))
+                shots.append(path)
+                print(f'已保存 {path}')
+        else:
+            path = out_dir / f'{stage + 1}_{STAGE_SPECS[stage][0]}.png'
+            window.grab().save(str(path))
+            shots.append(path)
+            print(f'已保存 {path}')
 
     # ---- 冒烟断言：缓冲里得有东西，心率要能算出来 ----
     snapshot = buffers.snapshot()

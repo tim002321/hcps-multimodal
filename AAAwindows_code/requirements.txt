@@ -1,5 +1,33 @@
+# 采集与界面（main.py / run_monitor.py）—— 必需
 bleak>=0.21.0
-# 可视化界面（run_monitor.py）
 PyQt5==5.15.11
 pyqtgraph>=0.13
 numpy>=1.24
+# 摄像头采集与打哈欠检测的图像处理都用它（代码里是懒加载，但实际必需）
+opencv-python>=4.8
+
+# ---------------------------------------------------------------------------
+# 摄像头实时打哈欠检测（vision/）—— 可选，不装就不影响采集与界面
+#
+# 张嘴判定：**不需要额外装推理引擎**，直接用 opencv 自带的 cv2.dnn 跑 ONNX
+#         （实测与 onnxruntime 输出逐位相同，单帧约 2~5ms）。
+#
+# 人脸检测两条路，二选一：
+#   1) 有 NVIDIA 显卡、想走 GPU：装 ultralytics（会连带装 torch）
+#        pip install ultralytics
+#      CUDA 版 torch 要单独装（约 2.3GB）：
+#        pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 ^
+#            --index-url https://download.pytorch.org/whl/cu121
+#   2) 只用 CPU：先下 models/yolov8n-face.onnx，再把 config.ini 的
+#      [vision] backend 设成 onnx，不必装 torch。
+#
+# 模型权重不进版本库，用脚本获取：
+#     python tools/vision/fetch_models.py --with-onnx
+#
+# 本机已验证的组合（Windows 11 / Python 3.12 / RTX 3060 Laptop 6GB）：
+#     torch 2.5.1+cu121  torchvision 0.20.1+cu121  ultralytics 8.4.193
+#     numpy 1.26.0（不要升到 2.x，pyqtgraph 旧版会不兼容）
+#
+# 注意：torch / ultralytics 会被 run_monitor.py 在导入 cv2、PyQt5 之前先加载。
+# 顺序反了会在 Windows 上段错误退出，详见 README「三个已经踩过的坑」。
+# ---------------------------------------------------------------------------

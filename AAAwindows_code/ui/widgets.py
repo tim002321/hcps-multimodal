@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QLinearGradient, QPainter, QPen
+from PyQt5.QtGui import QColor, QFont, QLinearGradient, QPainter, QPen
 from PyQt5.QtWidgets import (QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel,
                              QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
@@ -31,7 +31,7 @@ def pill(text: str, color: str = theme.PALETTE['blue'], bg: str = '#EAF2FB',
          border: str = '#9DBBDD') -> QLabel:
     widget = QLabel(text)
     widget.setStyleSheet(
-        f'border-radius: 2px; padding: 3px 10px; font-size: 11px;'
+        f'border-radius: 2px; padding: 3px 10px; font-size: {theme.pt(theme.FS_SMALL)};'
         f'background-color: {bg}; border: 1px solid {border}; color: {color};')
     return widget
 
@@ -53,11 +53,11 @@ class SectionBar(QFrame):
         layout.setContentsMargins(8, 3, 8, 3)
         layout.setSpacing(6)
         self.title = label(title, '')
-        self.title.setStyleSheet('color: #FFFFFF; font-weight: bold; font-size: 12px;'
+        self.title.setStyleSheet(f'color: #FFFFFF; font-weight: bold; font-size: {theme.pt(theme.FS_BASE)};'
                                  ' background: transparent; border: none;')
         layout.addWidget(self.title)
         layout.addStretch(1)
-        self.setMinimumHeight(24)
+        self.setMinimumHeight(theme.scaled(24))
 
     def set_title(self, text: str) -> None:
         self.title.setText(text)
@@ -109,8 +109,8 @@ class StatTile(QFrame):
         row = QHBoxLayout()
         row.setSpacing(4)
         self.value = label(value, 'StatValue')
-        self.value.setStyleSheet(f'font-family: "Consolas"; font-size: 20px; font-weight: bold;'
-                                 f' color: {accent};')
+        self.value.setStyleSheet(f'font-family: "Consolas"; font-size: {theme.pt(theme.FS_METRIC)};'
+                                 f' font-weight: bold; color: {accent};')
         row.addWidget(self.value)
         if unit:
             row.addWidget(label(unit, 'StatUnit'))
@@ -123,7 +123,7 @@ class StatTile(QFrame):
     def set_value(self, value: str, note: Optional[str] = None, accent: Optional[str] = None) -> None:
         self.value.setText(value)
         if accent:
-            self.value.setStyleSheet(f'font-family: "Consolas"; font-size: 20px;'
+            self.value.setStyleSheet(f'font-family: "Consolas"; font-size: {theme.pt(theme.FS_METRIC)};'
                                      f' font-weight: bold; color: {accent};')
         if note is not None:
             self.note.setText(note)
@@ -138,7 +138,7 @@ class NavItem(QPushButton):
         self.setObjectName('NavItem')
         self.setCheckable(True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumHeight(32)
+        self.setMinimumHeight(theme.scaled(32))
 
 
 class PageBackdrop(QWidget):
@@ -179,7 +179,7 @@ class ChartPanel(QFrame):
         head.addWidget(self.title_label)
         head.addStretch(1)
         self.value_label = QLabel('--')
-        self.value_label.setStyleSheet('font-family: "Consolas"; font-size: 14px;'
+        self.value_label.setStyleSheet(f'font-family: "Consolas"; font-size: {theme.pt(theme.FS_SUB)};'
                                        ' color: #C00000; background: transparent;')
         head.addWidget(self.value_label)
         self.unit_label = label(unit, 'CardHint')
@@ -191,8 +191,13 @@ class ChartPanel(QFrame):
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         self.plot.setMouseEnabled(x=False, y=False)
         self.plot.hideButtons()
+        # pyqtgraph 的坐标轴刻度不吃 QSS，字号必须直接塞给 AxisItem，
+        # 否则整块界面放大了，轴上的数字还是原来那么大（甚至更看不清）。
+        tick_font = QFont(theme.FONT_MONO)
+        tick_font.setPointSizeF(theme.scaled_pt(theme.PLOT_TICK_PT))
         for axis in ('left', 'bottom'):
             ax = self.plot.getAxis(axis)
+            ax.setStyle(tickFont=tick_font)
             ax.setPen(pg.mkPen('#808080'))
             ax.setTextPen(pg.mkPen(theme.PALETTE['plot_text']))
         self._cursor = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen('#FFD700', width=1))

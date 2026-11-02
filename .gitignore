@@ -27,3 +27,12 @@ AAAwindows_code/ecg_data.jsonl
 
 # 自检/冒烟测试跑出来的结果库（任何层级的「实验结果」目录）
 实验结果/
+
+# 推理模型权重：单个 6~13MB，用 tools/vision/fetch_models.py 获取，不进版本库
+AAAwindows_code/models/*.pt
+AAAwindows_code/models/*.onnx
+AAAwindows_code/models/*.part
+
+# 工作记忆与自检截图（本地产物，不进版本库）
+.workbuddy/
+AAAwindows_code/ui_shots/
