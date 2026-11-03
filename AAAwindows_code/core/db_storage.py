@@ -5,7 +5,8 @@
 
 功能：
   - 在 `<项目根>/data/` 下按当前系统时间创建 SQLite 数据库文件，例如 data/20260903_183000.db
-  - 数据按类型写入不同的数据表：ecg_data / breath_data / triaxial_data / temperature_data 等
+  - 数据按类型写入不同的数据表：ecg_data / triaxial_data / temperature_data 等
+    （breath_data 由 SAVE_RESP 控制，当前默认关闭）
   - 每张表包含两列：
         time   当前系统时间（文本）
         value  传感器数据（标量或复杂结构，统一以 JSON 字符串存储）
@@ -31,6 +32,11 @@ BRACELET_GSR_TABLE = "bracelet_gsr_data"          # 皮电，每个样本一行�
 BRACELET_SKIN_TEMP_TABLE = "bracelet_skin_temp"   # 肤温，每次上报一行（标量，℃）
 BRACELET_BATTERY_TABLE = "bracelet_battery"       # 电量，每次上报一行 {"adc":..,"percent":..}
 
+
+# 呼吸通道是否入库。先关掉：现场多数会话这一路全是 0（没接呼吸带），
+# 存进去只会在回放里多一条直线，还占空间。实时曲线的数据不受影响
+# —— 它走 LiveBuffers，不经过这里。要恢复改成 True 即可。
+SAVE_RESP = False
 
 # 批量提交默认参数（避免每次 insert 都 fsync，减少对事件循环/写线程的阻塞）
 DEFAULT_COMMIT_INTERVAL = 0.5   # 秒：距上次提交超过该时间就提交一次
@@ -214,8 +220,8 @@ class SensorDB:
 class DataRecorder:
     """统一的传感器数据入库接口（供各接收模块调用）。
 
-    当前已接入：心电(ecg_data)、体温(temperature_data)、呼吸(breath_data)、
-    三轴(triaxial_data)。
+    当前已接入：心电(ecg_data)、体温(temperature_data)、三轴(triaxial_data)；
+    呼吸(breath_data) 暂时不入库，见模块级 SAVE_RESP。
 
     接入其他传感器的方式（二选一）：
       1. 直接调用通用接口：recorder.store("spo2_data", [98, 97, ...])
@@ -247,7 +253,7 @@ class DataRecorder:
             if "ECG" in ecg:
                 self.storage.insert_many("ecg_data", ecg["ECG"], ts)
 
-        if "呼吸" in decoded:
+        if SAVE_RESP and "呼吸" in decoded:
             self.storage.insert_many("breath_data", decoded["呼吸"], ts)
 
         if "三轴" in decoded:

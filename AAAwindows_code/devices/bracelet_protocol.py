@@ -10,6 +10,7 @@
 0x21    29B     1s        皮电 GSR（10 个 16bit 样本）
 0x33    12B     10s       肤温（CT1711 数字量）
 0x34    11B     —         电量（ADC → 百分比）
+0x35    11B     —         电量（同上；设备实际发的是这个字，两个都收）
 ======  ======  ========  ==============================================
 
 帧结构：
@@ -31,6 +32,7 @@ from typing import List, Optional
 __all__ = [
     'FRAME_HEADER', 'COMMON_NOTIFY_UUIDS',
     'TYPE_PPG_ACCEL', 'TYPE_GSR', 'TYPE_SKIN_TEMP', 'TYPE_BATTERY',
+    'TYPE_BATTERY_ALT',
     'LEN_PPG_ACCEL', 'LEN_GSR', 'LEN_SKIN_TEMP', 'LEN_BATTERY',
     'PPGAccelData', 'GSRData', 'SkinTempData', 'BatteryData',
     'ProtocolParser',
@@ -47,7 +49,8 @@ FRAME_HEADER = bytes([0x00, 0xAA, 0x00, 0xCC])
 TYPE_PPG_ACCEL = 0x30   # 4 通道 PPG + 腕部三轴加速度
 TYPE_GSR = 0x21         # 皮电数据
 TYPE_SKIN_TEMP = 0x33   # 肤温数据
-TYPE_BATTERY = 0x34     # 手环电量
+TYPE_BATTERY = 0x34         # 手环电量（协议示例里的字）
+TYPE_BATTERY_ALT = 0x35     # 手环电量（设备实际发的字，与 0x34 并存兼容）
 
 # 各类型数据包总长度（含帧头）
 LEN_PPG_ACCEL = 177     # 帧头4 + 设备ID4 + 类型1 + 计数2 + PPG160 + 加速度6
@@ -204,7 +207,7 @@ class ProtocolParser:
             return 9, LEN_GSR
         if data_type == TYPE_SKIN_TEMP:
             return 9, LEN_SKIN_TEMP
-        if data_type == TYPE_BATTERY:
+        if data_type in (TYPE_BATTERY, TYPE_BATTERY_ALT):
             return 9, LEN_BATTERY
         return None
 
@@ -226,7 +229,7 @@ class ProtocolParser:
             self._parse_gsr(frame, device_id, payload_offset)
         elif data_type == TYPE_SKIN_TEMP:
             self._parse_temp(frame, device_id, payload_offset)
-        elif data_type == TYPE_BATTERY:
+        elif data_type in (TYPE_BATTERY, TYPE_BATTERY_ALT):
             self._parse_battery(frame, device_id, payload_offset)
 
     # ---------------------------------------------------------- 各类解析

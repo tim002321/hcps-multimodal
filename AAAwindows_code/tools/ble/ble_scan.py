@@ -61,6 +61,16 @@ async def main() -> int:
 
     print('\n心电贴：{}'.format('已找到 ' + ', '.join(ecg_hit) if ecg_hit else '未找到'))
     print('手环：{}'.format('已找到 ' + ', '.join(bracelet_hit) if bracelet_hit else '未找到'))
+
+    # 汇总一行：没有它的话，默认只列带名字的设备，周围全是匿名广播时
+    # 表格会是空的，看起来像蓝牙没开 —— 实际只是没扫到目标设备。
+    total = len(found)
+    named = sum(1 for device, adv in found.values() if (device.name or adv.local_name))
+    print('共扫到 {} 个广播（其中 {} 个带名字）'.format(total, named))
+    if total == 0:
+        print('  → 一个广播都没有：蓝牙可能没开，或适配器异常')
+    elif not ecg_hit and not bracelet_hit:
+        print('  → 蓝牙工作正常，但目标设备不在广播：确认心电贴/手环已开机并在附近')
     return 0 if (ecg_hit or bracelet_hit) else 1
 
 
