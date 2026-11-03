@@ -56,7 +56,7 @@ ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
 #   觉得还不够大就用命令行或配置再乘一档，pt 值会整体等比放大。
 #       python run_monitor.py --ui-scale 1.15
 #       set HCP_UI_SCALE=1.15        （或 config.ini 的 [ui] scale）
-FONT_SCALE = 1.0
+FONT_SCALE = 1.25   # 面向客户演示：整体字号比原始设计放大 25%
 
 # 字号阶梯（pt）。括号里是它在标准 96dpi 屏上的等效像素，方便和旧值对照。
 FS_SMALL = 8.25        # 次要说明 / 单位 / 表头（≈11px）

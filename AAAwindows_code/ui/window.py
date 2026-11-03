@@ -33,8 +33,10 @@ from ui.buffers import (ECG_ACCEL_RATE, ECG_RATE, RESP_RATE, LiveBuffers, ecg_si
                         estimate_heart_rate, estimate_resp_rate, resp_has_signal)
 from ui.pages_extra import AnalysisPage, EmgPage, EyePage, RecognizePage
 from ui.profile import DATA_DEVICES
+from analysis.features import bandpass_emph, find_peaks
 from ui.replay import (ReplayPlayer, format_size, instrument_spans, list_db_sources,
-                       list_sessions, load_packets, overlap_window)
+                       list_session_folders, list_sessions, load_packets,
+                       overlap_window)
 from ui.widgets import (Card, ChartPanel, NavItem, PageBackdrop, ParamListPanel,
                         StatTile, dot, label, mono, pill)
 # 只导入线程与状态对象；torch/onnxruntime 在 YawnMonitor.run() 里才延迟加载，
@@ -53,20 +55,30 @@ PAGE_SPECS = [
     ('camera',    '摄像头',     '采集',     'CameraPage',    'camera'),
     ('emg',       '表面肌电',   '采集',     'EmgPage',       'emg'),
     ('eye',       '眼动仪',     '采集',     'EyePage',       'eye'),
-    ('status',    '会话与回放', '数据查看', 'StatusPage',    None),
+    ('status',    '回放与选段', '回放',     'StatusPage',    None),
+    ('playback',  '回放观看',   '回放',     'PlaybackPage',  None),
     ('recognize', '实时结果',   '状态识别', 'RecognizePage', None),
-    ('analysis',  '区间分析',   '数据分析', 'AnalysisPage',  None),
+    ('analysis',  '数据分析',   '数据分析', 'AnalysisPage',  None),
 ]
 
 ALL_DEVICES = ('ecg', 'bracelet', 'camera', 'emg', 'eye')
 
+# 手环肤温暂时不在界面露出（采集页的数值块、回放页的曲线和勾选项）。
+# 数据照常入库，只是不显示；要恢复改成 True。
+SHOW_SKIN_TEMP = False
+
+# 心电贴的呼吸通道暂时不在界面露出：呼吸率数值块、呼吸波形通道、
+# 回放里的呼吸曲线和勾选项。数据本来就不入库（见 core/db_storage.SAVE_RESP）。
+SHOW_RESP = False
+
 # 三段式流程：页面归属哪一段。没列出的都算采集段（prep/ecg/bracelet/camera/emg/eye/recognize）。
 STAGE_SPECS = [
     ('采集', '连接设备并录制数据'),
-    ('回放与选段', '从录制结果里挑出要分析的片段'),
-    ('数据分析', '勾选模型出结果'),
+    ('回放与选段', '挑出要分析的片段'),
+    ('回放观看', '播放选定的片段'),
+    ('数据分析', '选择模型出结果'),
 ]
-STAGE_OF_KEY = {'status': 1, 'analysis': 2}
+STAGE_OF_KEY = {'status': 1, 'playback': 2, 'analysis': 3}
 
 
 def stage_of_key(key: str) -> int:
@@ -234,20 +246,24 @@ class EcgPage(ChannelGridPage):
     subtitle = ''
     CHANNELS = [
         {'key': 'ecg', 'title': '心电波形', 'unit': 'ADC'},
-        {'key': 'resp', 'title': '呼吸波形', 'unit': ''},
         {'key': 'accx', 'title': '三轴 X', 'unit': 'g'},
         {'key': 'accy', 'title': '三轴 Y', 'unit': 'g'},
         {'key': 'accz', 'title': '三轴 Z', 'unit': 'g'},
         {'key': 'temp', 'title': '体温趋势', 'unit': '℃'},
     ]
-    DEFAULT_SELECTED = ['ecg', 'resp', 'accx', 'accy']
+    if SHOW_RESP:
+        CHANNELS.insert(1, {'key': 'resp', 'title': '呼吸波形', 'unit': ''})
+    DEFAULT_SELECTED = ['ecg'] + (['resp'] if SHOW_RESP else []) + ['accx', 'accy']
 
     def build_tiles(self) -> None:
         # 数值块只留指标名 + 单位；"峰值法估计"这类方法说明属于实现细节，不上界面
         self.tile_hr = StatTile('心率', 'bpm', '--', theme.PALETTE['red'])
         self.tile_temp = StatTile('体温', '℃', '--', theme.PALETTE['red'])
+        # 控件照建（on_tick 仍会更新），不放进布局就等于不显示
         self.tile_resp = StatTile('呼吸率', '次/分', '--', theme.PALETTE['red'])
         for tile in (self.tile_hr, self.tile_temp, self.tile_resp):
+            if tile is self.tile_resp and not SHOW_RESP:
+                continue
             self.tiles_row.addWidget(tile, 1)
 
     @staticmethod
@@ -343,15 +359,19 @@ class BraceletPage(ChannelGridPage):
 
     def build_tiles(self) -> None:
         self.tile_gsr = StatTile('GSR 均值', '', '--', theme.PALETTE['red'])
+        # 控件照建（on_tick 里还会更新它），只是不放进布局 ———
+        # 这样开关一开就能显示，不用改其它代码
         self.tile_skin = StatTile('肤温', '℃', '--', theme.PALETTE['red'])
         self.tile_battery = StatTile('电量', '%', '--', theme.PALETTE['red'])
         for tile in (self.tile_gsr, self.tile_skin, self.tile_battery):
+            if tile is self.tile_skin and not SHOW_SKIN_TEMP:
+                continue
             self.tiles_row.addWidget(tile, 1)
 
     def channel_data(self, snapshot: Dict[str, Any]):
         rates = snapshot.get('rates') or {}
         ppg_rate = rates.get('ppg_points') or 130.0
-        gsr_rate = rates.get('gsr') or 5.0
+        gsr_rate = rates.get('gsr') or 10.0            # 协议 1 秒 10 个样本
         bracelet_accel = snapshot['bracelet_accel']
         ppg = snapshot['ppg']
         window = max(8, int(ppg_rate * 0.8))            # 约 0.8 秒的滑动均值当基线
@@ -368,7 +388,7 @@ class BraceletPage(ChannelGridPage):
             'ppg2': (ppg_ac['PPG2'], ppg_rate, last(ppg_ac['PPG2'], 1)),
             'ppg3': (ppg_ac['PPG3'], ppg_rate, last(ppg_ac['PPG3'], 1)),
             'ppg4': (ppg_ac['PPG4'], ppg_rate, last(ppg_ac['PPG4'], 1)),
-            'gsr': (snapshot['gsr'], gsr_rate, last(snapshot['gsr'], 1)),
+            'gsr': (snapshot['gsr'], gsr_rate, last(snapshot['gsr'], 3)),
             'wx': (bracelet_accel['x'], max(1.0, ppg_rate / 10.0), last(bracelet_accel['x'], 2)),
             'wy': (bracelet_accel['y'], max(1.0, ppg_rate / 10.0), last(bracelet_accel['y'], 2)),
             'wz': (bracelet_accel['z'], max(1.0, ppg_rate / 10.0), last(bracelet_accel['z'], 2)),
@@ -393,10 +413,18 @@ class BraceletPage(ChannelGridPage):
         counters = snapshot['counters']
         if snapshot['gsr']:
             gsr = np.asarray(snapshot['gsr'], dtype=float)
-            if gsr.max() - gsr.min() < 1e-6 and abs(gsr.mean()) < 1e-6:
+            mean = float(gsr.mean())
+            span = float(gsr.max() - gsr.min())
+            # 皮电的实际量级是 0.001~2（原始刻度），原来用 .1f 显示，
+            # 0.0014 会直接变成 "0.0"，看着像没数据。按量级给精度。
+            if span < 1e-6 and abs(mean) < 1e-6:
                 self.tile_gsr.set_value('--', note='GSR 无信号（未接触）')
+            elif span < 1e-6:
+                self.tile_gsr.set_value(f'{mean:.3f}', note='GSR 恒定（电极可能未贴合）')
+            elif mean < 0.1:
+                self.tile_gsr.set_value(f'{mean:.3f}', note='原始刻度（未标定）')
             else:
-                self.tile_gsr.set_value(f'{gsr.mean():.1f}')
+                self.tile_gsr.set_value(f'{mean:.2f}', note='原始刻度（未标定）')
         if snapshot['skin_temp'] is not None:
             self.tile_skin.set_value(f'{snapshot["skin_temp"]:.2f}')
         battery = snapshot.get('battery') or {}
@@ -426,11 +454,25 @@ class StatusPage(BasePage):
         'resp':    ('呼吸',      'ADC', [('RESP', '#FFD700')]),
         'accel':   ('三轴',      'g',   [('X', '#FF5252'), ('Y', '#00E676'), ('Z', '#00D0FF')]),
         'temp':    ('体温',      '℃',   [('体温', '#FF80AB')]),
-        'ppg':     ('PPG',       'ADC', [('PPG1', '#00E676')]),
+        'ppg':     ('PPG',       '',    [('PPG1', '#00E676')]),   # 数值显示脉率，自带单位
         'b_accel': ('腕部三轴',   'g',   [('X', '#FF5252'), ('Y', '#00E676'), ('Z', '#00D0FF')]),
         'gsr':     ('皮电 GSR',  'ADC', [('GSR', '#B388FF')]),
         'b_temp':  ('肤温',      '℃',   [('肤温', '#FFD700')]),
         'battery': ('电量',      '%',   [('电量', '#00D0FF')]),
+    }
+
+    # 右上角那个数字各是什么意思，悬停说明
+    VALUE_TIPS = {
+        'ecg': '右上角是最近一个心电采样点的幅值（ADC）',
+        'resp': '右上角是最近一个呼吸采样点的幅值（ADC）',
+        'accel': '右上角是三轴合成模长 |a|（静止约 1g，动作越大越高）',
+        'temp': '右上角是最近一次测到的体温',
+        'ppg': '右上角是从最近 10 秒脉搏波估的脉率；'
+               '信号接触不良时会偏高或偏低，仅供参考。曲线是去基线后的波形',
+        'b_accel': '右上角是腕部三轴合成模长 |a|（静止约 1g）',
+        'gsr': '右上角是最近一个皮电采样值（原始刻度，不是 μS）',
+        'b_temp': '右上角是手环测到的肤温',
+        'battery': '右上角是手环电量百分比',
     }
 
     def build(self) -> None:
@@ -464,29 +506,22 @@ class StatusPage(BasePage):
         replay_card = Card('回放控制')
         self.replay_combo = QComboBox()
         refresh = QPushButton('刷新')
-        refresh.clicked.connect(self._refresh_sessions)
+        refresh.clicked.connect(self._reload_sessions)
         self.delete_button = QPushButton('删除')
         self.delete_button.setObjectName('Danger')
         self.delete_button.clicked.connect(self._delete_session)
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(label('人员', 'Dim'))
+        self.folder_combo = QComboBox()
+        self.folder_combo.currentIndexChanged.connect(self._refresh_sessions)
+        folder_row.addWidget(self.folder_combo, 1)
+        replay_card.add_layout(folder_row)
+
         row = QHBoxLayout()
         row.addWidget(self.replay_combo, 1)
         row.addWidget(refresh)
         row.addWidget(self.delete_button)
         replay_card.add_layout(row)
-        row2 = QHBoxLayout()
-        row2.addWidget(label('倍速', 'Dim'))
-        self.speed_spin = QDoubleSpinBox()
-        self.speed_spin.setRange(0.25, 50.0)
-        self.speed_spin.setValue(2.0)
-        self.speed_spin.setFixedWidth(80)
-        row2.addWidget(self.speed_spin)
-        self.replay_button = QPushButton('开始回放')
-        self.replay_button.setObjectName('Primary')
-        self.replay_button.clicked.connect(self._toggle_replay)
-        row2.addWidget(self.replay_button)
-        row2.addStretch(1)
-        replay_card.add_layout(row2)
-
         # 回放内容：把选中的会话库里实际有数据的表列出来，逐项勾选。
         # 空表不列（勾了也没内容，反而让人以为坏了）。
         pick_row = QHBoxLayout()
@@ -511,7 +546,6 @@ class StatusPage(BasePage):
         replay_card.add(self.source_hint)
         self.replay_combo.currentIndexChanged.connect(self._refresh_sources)
         self.source_list.itemChanged.connect(self._on_source_check_changed)
-        self.source_list.itemClicked.connect(self._focus_source)
 
         # 时间轴：每条设备一条"在线时段"横条，上面压一个可拖拽的区间选择。
         # 原来的只读进度条只能看不能选，所以没法回答"我要分析哪一段"。
@@ -548,7 +582,7 @@ class StatusPage(BasePage):
         self.auto_pick = QPushButton('自动选区')
         self.auto_pick.setToolTip('自动选中所有设备同时在线的那一段')
         self.auto_pick.clicked.connect(self._auto_pick_overlap)
-        self.to_analysis = QPushButton('进入分析')
+        self.to_analysis = QPushButton('查看回放')
         self.to_analysis.setObjectName('Primary')
         self.to_analysis.clicked.connect(self._goto_analysis)
         tl_row.addWidget(self.auto_pick)
@@ -568,131 +602,7 @@ class StatusPage(BasePage):
         body.addLayout(right, 1)
         self.content.addLayout(body)
 
-        # ---- 回放预览区 ----
-        # 左边摄像头独占一块大版面（回放时的画面就是靠它看细节），
-        # 右边按「回放内容」里勾选的表动态铺折线图：勾一个出一条，取消就收掉。
-        preview_row = QHBoxLayout()
-        preview_row.setSpacing(8)
-
-        self.camera_card = Card('回放画面')
-        self.preview_camera = QLabel('无摄像头帧')
-        self.preview_camera.setAlignment(Qt.AlignCenter)
-        self.preview_camera.setMinimumSize(theme.scaled(360), theme.scaled(200))
-        self.preview_camera.setStyleSheet(
-            'background-color: #101010; color: #C8C8C8; border: 1px solid #808080;')
-        self.camera_card.add(self.preview_camera, 1)
-        self.camera_card.setMinimumHeight(theme.scaled(220))
-        preview_row.addWidget(self.camera_card, 5)
-
-        self.chart_host = QWidget()
-        self.chart_grid = QGridLayout(self.chart_host)
-        self.chart_grid.setContentsMargins(0, 0, 0, 0)
-        self.chart_grid.setSpacing(8)
-        self.chart_scroll = QScrollArea()
-        self.chart_scroll.setWidgetResizable(True)
-        self.chart_scroll.setWidget(self.chart_host)
-        self.chart_scroll.setMinimumHeight(theme.scaled(240))
-        preview_row.addWidget(self.chart_scroll, 6)
-
-        self.content.addLayout(preview_row, 1)
-        self._charts: Dict[str, ChartPanel] = {}
-        self._active_source = ''
-        self._scalar_hist = {'b_temp': deque(maxlen=900), 'battery': deque(maxlen=900)}
-        self._refresh_sessions()
-
-    def on_data(self, snapshot: Dict[str, Any]) -> None:
-        """回放预览：按勾选的内容，把每一路数据画进各自的图里。"""
-        rates = snapshot.get('rates') or {}
-        counters = snapshot.get('counters') or {}
-
-        fs_ecg = rates.get('ecg_samples') or ECG_RATE
-        if fs_ecg < 50:
-            fs_ecg = ECG_RATE
-        end_ecg = counters.get('ecg_samples', 0) / fs_ecg
-        ppg_rate = rates.get('ppg_points') or 130.0
-        end_ppg = counters.get('ppg_samples', 0) / ppg_rate
-        gsr_rate = rates.get('gsr') or 5.0
-        end_gsr = counters.get('gsr_samples', 0) / gsr_rate
-        b_accel_rate = rates.get('bracelet_accel') or 10.0
-
-        for key, panel in self._charts.items():
-            try:
-                if key == 'ecg':
-                    ecg = snapshot['ecg']
-                    panel.set_series('ECG', ecg, fs_ecg, end_time=end_ecg)
-                    panel.set_value('{:,.0f} 点'.format(float(np.size(ecg))))
-                elif key == 'resp':
-                    panel.set_series('RESP', snapshot['resp'], RESP_RATE, end_time=end_ecg)
-                elif key == 'accel':
-                    # 缓冲里的三轴键是小写 x/y/z（见 ui/buffers.py），图例仍用大写
-                    accel = snapshot.get('ecg_accel') or {}
-                    for axis in ('X', 'Y', 'Z'):
-                        panel.set_series(axis, accel.get(axis.lower(), ()), ECG_ACCEL_RATE,
-                                         end_time=end_ecg)
-                elif key == 'temp':
-                    panel.set_series('体温', snapshot['temp'], 1.0, end_time=end_ecg)
-                elif key == 'ppg':
-                    ppg = snapshot['ppg']['PPG1']
-                    panel.set_series('PPG1', ac_couple(ppg, max(8, int(ppg_rate * 0.8))),
-                                     ppg_rate, end_time=end_ppg)
-                elif key == 'b_accel':
-                    accel = snapshot.get('bracelet_accel') or {}
-                    for axis in ('X', 'Y', 'Z'):
-                        panel.set_series(axis, accel.get(axis.lower(), ()), b_accel_rate,
-                                         end_time=end_ppg)
-                elif key == 'gsr':
-                    panel.set_series('GSR', snapshot['gsr'], gsr_rate, end_time=end_gsr)
-                elif key in ('b_temp', 'battery'):
-                    self._push_scalar(key, snapshot, panel)
-            except Exception:                             # noqa: BLE001 - 单图出错不拖垮整页
-                continue
-
-        self._update_camera_preview(snapshot)
-
-    def _push_scalar(self, key: str, snapshot: Dict[str, Any], panel) -> None:
-        """肤温 / 电量是单值，没有历史数组，这里按帧累积成一条线。"""
-        if key == 'b_temp':
-            value = snapshot.get('skin_temp')
-            curve, unit = '肤温', '℃'
-        else:
-            battery = snapshot.get('battery') or {}
-            value = battery.get('percent') or battery.get('电量')
-            curve, unit = '电量', '%'
-        if value is None:
-            return
-        hist = self._scalar_hist[key]
-        hist.append(float(value))
-        series = list(hist)
-        panel.set_series(curve, series, 1.0, end_time=float(len(series)))
-        panel.set_value('{:.1f}{}'.format(series[-1], unit))
-
-    def _update_camera_preview(self, snapshot: Dict[str, Any]) -> None:
-        """回放（或实时）画面：优先用回放流里的帧，没有就用正在采集的摄像头帧。"""
-        import cv2
-        import numpy as np
-
-        frame = snapshot.get('camera_frame')
-        if frame is None and self.window_ref.camera_service is not None:
-            frame = self.window_ref.camera_service.latest_frame()
-        if not frame:
-            return
-        jpeg, index, _stamp = frame
-        now = time.time()
-        if index == getattr(self, '_camera_index', None) and \
-                now - getattr(self, '_camera_at', 0.0) < 0.15:
-            return
-        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
-        if image is None:
-            return
-        self._camera_index = index
-        self._camera_at = now
-        rgb = np.ascontiguousarray(image[:, :, ::-1])
-        height, width, _ = rgb.shape
-        qimage = QImage(rgb.data, width, height, 3 * width, QImage.Format_RGB888).copy()
-        self.preview_camera.setPixmap(QPixmap.fromImage(qimage).scaled(
-            max(64, self.preview_camera.width() - 4),
-            max(64, self.preview_camera.height() - 4),
-            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        self._reload_sessions()
 
     @staticmethod
     def _path_key(path) -> str:
@@ -707,6 +617,30 @@ class StatusPage(BasePage):
             if self._path_key(self.replay_combo.itemData(index)) == key:
                 return index
         return -1
+
+    def _reload_sessions(self) -> None:
+        """文件夹和会话列表一起重建（新建了任务目录之后要用这个）。"""
+        self._refresh_folders()
+        self._refresh_sessions()
+
+    def _refresh_folders(self) -> None:
+        """填「人员」下拉：全部 / 各人员姓名目录 / 未分类（data/ 根下的旧会话）。"""
+        if not hasattr(self, 'folder_combo'):
+            return
+        current = self.folder_combo.currentData()
+        self.folder_combo.blockSignals(True)
+        self.folder_combo.clear()
+        self.folder_combo.addItem('全部人员', None)
+        for name, _count in list_session_folders(DATA_DIR):
+            # 不显示数量：文件夹计数要跳过空库才准，而扫描每个库太慢，
+            # 标一个和实际列表不一致的数字，比不标更糟。
+            if not name:
+                self.folder_combo.addItem('未分类', '__root__')
+            else:
+                self.folder_combo.addItem(name, name)
+        index = self.folder_combo.findData(current)
+        self.folder_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.folder_combo.blockSignals(False)
 
     def sync_session(self, path: str) -> None:
         """把下拉框切到"正在回放的库"。
@@ -735,10 +669,17 @@ class StatusPage(BasePage):
         正在回放 A，界面显示的却是 B。
         """
         current = self.replay_combo.currentData()
+        folder = self.folder_combo.currentData() if hasattr(self, 'folder_combo') else None
+        if folder == '__root__':
+            sources = list_sessions(DATA_DIR, recursive=False)      # 只列 data/ 根下的旧会话
+        elif folder:
+            sources = list_sessions(DATA_DIR, folder=folder)        # 某一个人员文件夹
+        else:
+            sources = list_sessions(DATA_DIR)                       # 全部
         self.replay_combo.blockSignals(True)
         self.replay_combo.clear()
         # 用 DATA_DIR 而不是相对路径 'data'：从别的目录启动时列表不会变空
-        for path, mtime, size in list_sessions(DATA_DIR):
+        for path, mtime, size in sources:
             stamp = datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
             self.replay_combo.addItem(
                 f'{os.path.basename(path)}   {stamp}   {format_size(size)}', path)
@@ -762,7 +703,6 @@ class StatusPage(BasePage):
         if not path:
             self.source_list.blockSignals(False)
             self.source_hint.setText('先选会话')
-            self._sync_charts()
             return
         if str(path).lower().endswith('.jsonl'):
             item = QListWidgetItem('心电 · JSONL 每行一包')
@@ -772,21 +712,22 @@ class StatusPage(BasePage):
             self.source_list.addItem(item)
             self.source_list.blockSignals(False)
             self.source_hint.setText('JSONL 只含心电包')
-            self._sync_charts()
             return
         try:
             sources = list_db_sources(path)
         except Exception as exc:                          # noqa: BLE001 - 坏库不该拖垮页面
             self.source_list.blockSignals(False)
             self.source_hint.setText('读取失败：{}'.format(exc))
-            self._sync_charts()
             return
         if not sources:
             self.source_list.blockSignals(False)
             self.source_hint.setText('这个会话没有任何数据表')
-            self._sync_charts()
             return
         for key, group, name, count in sources:
+            if key == 'b_temp' and not SHOW_SKIN_TEMP:
+                continue                      # 肤温暂不露出
+            if key == 'resp' and not SHOW_RESP:
+                continue                      # 呼吸暂不露出
             item = QListWidgetItem('{:<4} {:<8} {:>9,} 行'.format(group, name, count))
             item.setData(Qt.UserRole, key)
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -794,11 +735,9 @@ class StatusPage(BasePage):
             self.source_list.addItem(item)
         self.source_list.blockSignals(False)
         self._update_source_hint()
-        self._sync_charts()
 
     def _on_source_check_changed(self, _item) -> None:
         self._update_source_hint()
-        self._sync_charts()
 
     def _update_source_hint(self) -> None:
         total = self.source_list.count()
@@ -812,7 +751,6 @@ class StatusPage(BasePage):
             self.source_list.item(index).setCheckState(state)
         self.source_list.blockSignals(False)
         self._update_source_hint()
-        self._sync_charts()                          # 信号被屏蔽了，这里必须手动同步一次
 
     def _selected_sources(self) -> List[str]:
         keys: List[str] = []
@@ -823,60 +761,6 @@ class StatusPage(BasePage):
         return keys
 
     # ------------------------------------------------- 图表与勾选联动
-    def _sync_charts(self) -> None:
-        """按勾选情况重建右侧折线图：勾一个出一条，取消就收掉。"""
-        want = [key for key in self._selected_sources() if key in self.REPLAY_CHARTS]
-        if want == list(self._charts.keys()):
-            return
-        while self.chart_grid.count():
-            old_item = self.chart_grid.takeAt(0)
-            old_widget = old_item.widget() if old_item is not None else None
-            if old_widget is not None:
-                old_widget.setParent(None)
-                old_widget.deleteLater()
-        self._charts.clear()
-        for row in range(self.chart_grid.rowCount()):
-            self.chart_grid.setRowStretch(row, 0)
-        for col in range(2):
-            self.chart_grid.setColumnStretch(col, 1)
-        for index, key in enumerate(want):
-            title, unit, curves = self.REPLAY_CHARTS[key]
-            panel = ChartPanel(title, unit)
-            for name, color in curves:
-                panel.add_curve(name, color, 1.3)
-            panel.plot.setMinimumHeight(theme.scaled(88))
-            self._charts[key] = panel
-            self.chart_grid.addWidget(panel, index // 2, index % 2)
-        if not want:
-            empty = label('未勾选任何可绘制的数据（摄像头画面在左侧）', 'CardHint')
-            empty.setAlignment(Qt.AlignCenter)
-            self.chart_grid.addWidget(empty, 0, 0, 1, 2)
-            self._apply_active()
-            return
-        # 最后一行吃掉剩余高度，图不会被拉成等高的大块空白
-        tail_row = (len(want) - 1) // 2 + 1
-        self.chart_grid.setRowStretch(tail_row, 1)
-        self._apply_active()
-
-    def _apply_active(self) -> None:
-        """把当前点选的那一路标出来：图标题前加 ▶，摄像头加蓝框。"""
-        for key, panel in self._charts.items():
-            title = self.REPLAY_CHARTS[key][0]
-            panel.set_title(('▶ ' if key == self._active_source else '') + title)
-        is_camera = self._active_source == 'camera'
-        self.preview_camera.setStyleSheet(
-            'background-color: #101010; color: #C8C8C8; border: {};'.format(
-                '2px solid #2E6DB4' if is_camera else '1px solid #808080'))
-
-    def _focus_source(self, item) -> None:
-        """点一行就把对应的图/画面标出来。"""
-        self._active_source = item.data(Qt.UserRole) or ''
-        self._apply_active()
-        if self._active_source in self._charts:
-            # 图多的时候把它滚进可见区，否则点了看不到反应
-            self.chart_scroll.ensureWidgetVisible(self._charts[self._active_source])
-
-    # ------------------------------------------------- 时间轴与区间选择
     def _refresh_timeline(self) -> None:
         """画出每台设备的在线时段，并把选区重置为整段。"""
         if not hasattr(self, 'timeline'):
@@ -973,14 +857,13 @@ class StatusPage(BasePage):
             self.selection_text.setText('选区太短（不足 0.5 秒），把两个把手拖宽一点')
             return False
         window = self.window_ref
+        # 带上勾选的数据源，回放观看页据此决定画哪几条曲线
         window.review_selection = {'path': path,
                                    'start': self._tl_origin + start,
-                                   'end': self._tl_origin + end}
-        window.mark_stage_done(1)          # 必须先解锁，否则 goto_stage(2) 会被门拦下
-        page = getattr(window, 'analysis_page', None)
-        if page is not None and hasattr(page, 'adopt_selection'):
-            page.adopt_selection()
-        window.goto_stage(2)
+                                   'end': self._tl_origin + end,
+                                   'include': self._selected_sources()}
+        window.mark_stage_done(1)          # 先解锁，否则 goto_stage(2) 会被门拦下
+        window.goto_stage(2)               # → 回放观看（自动播放）
         return True
 
     def _goto_analysis(self) -> None:
@@ -1018,31 +901,6 @@ class StatusPage(BasePage):
         self._refresh_sessions()
         self.replay_info.setText('已删除 {} 个文件：{}'.format(removed, os.path.basename(path)))
 
-    def _toggle_replay(self) -> None:
-        window = self.window_ref
-        if window.replay is not None:
-            window.stop_replay()
-            self.replay_button.setText('开始回放')
-            self.replay_button.setObjectName('Primary')
-            self.replay_button.setStyle(self.replay_button.style())
-            self.replay_info.setText('已停止回放')
-            return
-        path = self.replay_combo.currentData()
-        if not path:
-            self.replay_info.setText('没有可回放的文件')
-            return
-        include = self._selected_sources()
-        if not include:
-            self.replay_info.setText('请至少勾选一项「回放内容」')
-            return
-        count = window.start_replay(path, self.speed_spin.value(), include=include)
-        self.replay_button.setText('停止回放')
-        self.replay_button.setObjectName('Danger')
-        self.replay_button.setStyle(self.replay_button.style())
-        picked = len(include)
-        self.replay_info.setText(
-            f'回放 {os.path.basename(path)} · {count} 包 · '
-            f'{self.speed_spin.value():g}x · 已选 {picked} 项')
 
     def on_tick(self, snapshot: Dict[str, Any]) -> None:
         counters = snapshot['counters']
@@ -1061,25 +919,336 @@ class StatusPage(BasePage):
         self.session_label.setText(f'库文件：{self.window_ref.session_info.get("db_path", "—")}\n'
                                    f'数据源：{self.window_ref.session_info.get("source", "—")}')
 
+        # 选段页只负责"选"：游标跟着播放进度走，具体画面在下一屏看
         player = self.window_ref.replay
-        running = player is not None and player.is_alive()
-        if running:
+        if player is not None and player.is_alive():
             position, total, fraction = player.progress()
             self.play_cursor.setPos(fraction * max(self._tl_duration, 0.001))
-            source = self.window_ref.session_info.get('source', '回放')
-            self.replay_info.setText('{} · 第 {}/{} 包 · 倍速 {:g}x'.format(
-                source, position + 1, total, player.speed))
-            want_text, want_style = '停止回放', 'Danger'
+            self.replay_info.setText('正在回放 · 第 {}/{} 包'.format(position + 1, total))
+        elif player is not None:
+            self.window_ref.stop_replay()
+            self.play_cursor.setPos(max(self._tl_duration, 0.001))
+            self.replay_info.setText('回放结束')
+
+
+class PlaybackPage(BasePage):
+    """回放观看：整屏放画面（摄像头 + 折线图）。
+
+    和「回放与选段」拆开的原因：选段那页控件多（人员/会话/时间轴/勾选），
+    图挤在下面只有巴掌大；这一屏整屏给图像，选段页专心做选择。
+    """
+
+    title = '回放观看'
+    subtitle = '播放选定的片段'
+
+    REPLAY_CHARTS = StatusPage.REPLAY_CHARTS
+    VALUE_TIPS = StatusPage.VALUE_TIPS
+
+    def build(self) -> None:
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        bar.addWidget(label('倍速', 'Dim'))
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.25, 50.0)
+        self.speed_spin.setValue(2.0)
+        self.speed_spin.setFixedWidth(theme.scaled(84))
+        bar.addWidget(self.speed_spin)
+        self.play_button = QPushButton('重新播放')
+        self.play_button.setObjectName('Primary')
+        self.play_button.clicked.connect(self.replay)
+        bar.addWidget(self.play_button)
+        self.stop_button = QPushButton('停止')
+        self.stop_button.clicked.connect(lambda: self.window_ref.stop_replay())
+        bar.addWidget(self.stop_button)
+        self.play_info = mono('等待选择片段')
+        self.play_info.setWordWrap(True)
+        bar.addWidget(self.play_info, 1)
+        self.content.addLayout(bar)
+
+        preview_row = QHBoxLayout()
+        preview_row.setSpacing(8)
+        self.camera_card = Card('回放画面')
+        self.preview_camera = QLabel('无摄像头帧')
+        self.preview_camera.setAlignment(Qt.AlignCenter)
+        self.preview_camera.setMinimumSize(theme.scaled(420), theme.scaled(240))
+        self.preview_camera.setStyleSheet(
+            'background-color: #101010; color: #C8C8C8; border: 1px solid #808080;')
+        self.camera_card.add(self.preview_camera, 1)
+        preview_row.addWidget(self.camera_card, 5)
+
+        self.chart_host = QWidget()
+        self.chart_grid = QGridLayout(self.chart_host)
+        self.chart_grid.setContentsMargins(0, 0, 0, 0)
+        self.chart_grid.setSpacing(8)
+        self.chart_scroll = QScrollArea()
+        self.chart_scroll.setWidgetResizable(True)
+        self.chart_scroll.setWidget(self.chart_host)
+        preview_row.addWidget(self.chart_scroll, 6)
+        self.content.addLayout(preview_row, 1)
+
+        self._charts: Dict[str, ChartPanel] = {}
+        self._active_source = ''
+        self._scalar_hist = {'b_temp': deque(maxlen=900), 'battery': deque(maxlen=900)}
+
+    # ------------------------------------------------------------------
+    def on_show(self) -> None:
+        sel = getattr(self.window_ref, 'review_selection', None)
+        if not sel:
+            self._build_charts([])
+            self.play_info.setText('还没有选定片段：请先回到第 2 步选文件和时间区间')
+            return
+        self.replay()
+
+    def replay(self) -> None:
+        """按当前选区重新播放一遍。"""
+        sel = getattr(self.window_ref, 'review_selection', None)
+        if not sel or not sel.get('path'):
+            self.play_info.setText('还没有选定片段：请先在第 2 步选文件和时间区间')
+            return
+        self._build_charts(sel.get('include'))
+        try:
+            count = self.window_ref.start_replay(
+                sel['path'], self.speed_spin.value(),
+                include=sel.get('include'), time_range=(sel['start'], sel['end']))
+        except Exception as exc:                      # noqa: BLE001
+            self.play_info.setText('回放失败：{}'.format(exc))
+            return
+        self.play_info.setText('{} · 选段 {:.1f} 秒 · {} 包 · {:g}x'.format(
+            os.path.basename(sel['path']), sel['end'] - sel['start'],
+            count, self.speed_spin.value()))
+
+    def _build_charts(self, include: Optional[List[str]]) -> None:
+        """按选段时勾选的数据源建图；没传就全部画。"""
+        want = [key for key in (include or list(self.REPLAY_CHARTS))
+                if key in self.REPLAY_CHARTS]
+        if not SHOW_SKIN_TEMP:
+            want = [key for key in want if key != 'b_temp']
+        if not SHOW_RESP:
+            want = [key for key in want if key != 'resp']
+        if want == list(self._charts):
+            return
+        while self.chart_grid.count():
+            item = self.chart_grid.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.setParent(None)
+                widget.deleteLater()
+        self._charts.clear()
+        for row in range(self.chart_grid.rowCount()):
+            self.chart_grid.setRowStretch(row, 0)
+        for column in range(2):
+            self.chart_grid.setColumnStretch(column, 1)
+        for index, key in enumerate(want):
+            title, unit, curves = self.REPLAY_CHARTS[key]
+            panel = ChartPanel(title, unit)
+            for name, color in curves:
+                panel.add_curve(name, color, 1.3)
+            panel.plot.setMinimumHeight(theme.scaled(112))
+            # 右上角那几个值的含义不一，用悬停说明讲清楚，免得被当成精确读数
+            tip = self.VALUE_TIPS.get(key)
+            if tip:
+                panel.setToolTip(tip)
+            self._charts[key] = panel
+            self.chart_grid.addWidget(panel, index // 2, index % 2)
+        if want:
+            tail = (len(want) - 1) // 2 + 1
+            self.chart_grid.setRowStretch(tail, 1)
         else:
-            if player is not None:
-                self.window_ref.stop_replay()          # 自然放完
-                self.play_cursor.setPos(max(self._tl_duration, 0.001))
-                self.replay_info.setText('回放结束')
-            want_text, want_style = '开始回放', 'Primary'
-        if self.replay_button.text() != want_text:
-            self.replay_button.setText(want_text)
-            self.replay_button.setObjectName(want_style)
-            self.replay_button.setStyle(self.replay_button.style())
+            tip = label('还没有选段：回到「回放与选段」选好文件和时间区间', 'CardHint')
+            tip.setAlignment(Qt.AlignCenter)
+            self.chart_grid.addWidget(tip, 0, 0, 1, 2)
+
+    def on_data(self, snapshot: Dict[str, Any]) -> None:
+        """把回放流里的每一路数据画进各自的图。"""
+        rates = snapshot.get('rates') or {}
+        counters = snapshot.get('counters') or {}
+        # rates 是「按墙钟算的每秒样本数」：回放 N 倍速时会变成 N 倍，
+        # 除以倍速才是信号的采样率。不折算的话，2 倍速下 PPG 会被当成 500Hz，
+        # 峰检测的最小间隔和数据量要求全部翻倍，脉率永远算不出来。
+        speed = 1.0
+        player = getattr(self.window_ref, 'replay', None)
+        if player is not None and player.is_alive():
+            speed = max(0.05, float(getattr(player, 'speed', 1.0)))
+        fs_ecg = self._rate((rates.get('ecg_samples') or 0) / speed, 50, 1000, ECG_RATE)
+        ppg_rate = self._rate((rates.get('ppg_points') or 0) / speed, 50, 1000, 250.0)
+        gsr_rate = self._rate((rates.get('gsr') or 0) / speed, 1, 30, 10.0)
+        b_accel_rate = self._rate((rates.get('bracelet_accel') or 0) / speed, 5, 100, 20.0)
+        end_ecg = counters.get('ecg_samples', 0) / fs_ecg
+        end_ppg = counters.get('ppg_samples', 0) / ppg_rate
+        end_gsr = counters.get('gsr_samples', 0) / gsr_rate
+
+        for key, panel in self._charts.items():
+            try:
+                if key == 'ecg':
+                    ecg = snapshot['ecg']
+                    panel.set_series('ECG', ecg, fs_ecg, end_time=end_ecg)
+                    panel.set_value(self._fmt_latest(ecg, 0))
+                elif key == 'resp':
+                    resp = snapshot['resp']
+                    panel.set_series('RESP', resp, RESP_RATE, end_time=end_ecg)
+                    panel.set_value(self._fmt_latest(resp, 0))
+                elif key == 'accel':
+                    accel = snapshot.get('ecg_accel') or {}
+                    for axis in ('X', 'Y', 'Z'):
+                        panel.set_series(axis, accel.get(axis.lower(), ()), ECG_ACCEL_RATE,
+                                         end_time=end_ecg)
+                    panel.set_value(self._fmt_norm(accel))
+                elif key == 'temp':
+                    temp = snapshot['temp']
+                    # 每个心电贴包带 1 个温度值，包率 3.125/s → 约 3.1Hz。
+                    # 写 1.0 会把 79 个点拉成 79 秒，横轴直接变成负数。
+                    end_temp = len(temp) / 3.125
+                    panel.set_series('体温', temp, 3.125, end_time=end_temp)
+                    panel.set_value(self._fmt_latest(temp, 1))
+                elif key == 'ppg':
+                    ppg = snapshot['ppg']['PPG1']
+                    filtered = ac_couple(ppg, max(8, int(ppg_rate * 0.8)))
+                    panel.set_series('PPG1', filtered, ppg_rate, end_time=end_ppg)
+                    # 脉率每 0.5 秒算一次：峰检测是 Python 循环，逐帧跑会拖慢界面
+                    now = time.monotonic()
+                    if now - getattr(self, '_ppg_bpm_at', 0.0) >= 0.5:
+                        self._ppg_bpm_at = now
+                        value = self._pulse_bpm(filtered, ppg_rate)
+                        if value is not None:
+                            # 简单平滑：逐次算出来的脉率会因为个别错峰跳几十下，
+                            # 直接显示像在乱蹦。0.7 旧 + 0.3 新 既跟得上又不跳。
+                            old = getattr(self, '_ppg_bpm', None)
+                            self._ppg_bpm = value if old is None else old * 0.7 + value * 0.3
+                    bpm = getattr(self, '_ppg_bpm', None)
+                    panel.set_value('--' if bpm is None else '{:.0f} bpm'.format(bpm))
+                elif key == 'b_accel':
+                    accel = snapshot.get('bracelet_accel') or {}
+                    for axis in ('X', 'Y', 'Z'):
+                        panel.set_series(axis, accel.get(axis.lower(), ()), b_accel_rate,
+                                         end_time=end_ppg)
+                    panel.set_value(self._fmt_norm(accel))
+                elif key == 'gsr':
+                    gsr = snapshot['gsr']
+                    panel.set_series('GSR', gsr, gsr_rate, end_time=end_gsr)
+                    panel.set_value(self._fmt_latest(gsr, 3))
+                elif key in ('b_temp', 'battery'):
+                    self._push_scalar(key, snapshot, panel)
+            except Exception:                         # noqa: BLE001
+                continue
+        self._update_camera_preview(snapshot)
+
+    @staticmethod
+    def _fmt_latest(values: Any, digits: int = 1) -> str:
+        """图标题右上角的「当前值」：取序列最后一点。
+
+        以前只有心电那张设了值，而且设的是「共 N 点」——缓冲到上限后点数
+        不再增长，看起来就像坏了。其余 6 张图压根没设，永远显示 --。
+        """
+        try:
+            if values is None or len(values) == 0:
+                return '--'
+            return '{:.{d}f}'.format(float(values[-1]), d=digits)
+        except (TypeError, ValueError, IndexError):
+            return '--'
+
+    @staticmethod
+    def _rate(value: Any, low: float, high: float, fallback: float) -> float:
+        """速率合理性保护：超出 [low, high] 就用标称采样率。"""
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return number if low <= number <= high else fallback
+
+    @staticmethod
+    def _pulse_bpm(values: Any, fs: float) -> Optional[float]:
+        """从最近的脉搏波估脉率（次/分）。
+
+        PPG 的绝对值是光强 ADC（实测百万量级），直接显示没有物理意义，
+        所以右上角给脉率。处理方式与分析层的 extract_pulse 保持一致：
+        先去基线（0.05s/0.35s 差分带通），再按 0.33 秒不应期找峰。
+        """
+        try:
+            arr = np.asarray(values, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        if arr.size < fs * 3:
+            return None
+        tail = arr[-int(fs * 10):]                    # 10 秒：窗口太短时噪声主导，脉率会乱跳
+        band = bandpass_emph(tail, fs, fast_sec=0.05, slow_sec=0.35)
+        peaks = find_peaks(band, fs, min_interval_sec=0.33, rel_threshold=0.35)
+        if peaks.size < 3:
+            return None
+        interval = np.diff(peaks) / fs * 1000.0
+        interval = interval[(interval >= 300) & (interval <= 2000)]
+        if interval.size < 2:
+            return None
+        return 60000.0 / float(np.median(interval))
+
+    @staticmethod
+    def _fmt_norm(axes: Dict[str, Any], digits: int = 2) -> str:
+        """三轴图的当前值：三轴合成模长（静止约 1g，动作越大越高）。
+
+        三条曲线没法在一个数字里表达，取模长最能反映「现在动没动」。
+        """
+        try:
+            parts = [float(axes[key][-1]) for key in ('x', 'y', 'z')
+                     if axes.get(key) is not None and len(axes[key])]
+            if len(parts) < 3:
+                return '--'
+            return '{:.{d}f}'.format(sum(value * value for value in parts) ** 0.5, d=digits)
+        except (TypeError, ValueError, IndexError, KeyError):
+            return '--'
+
+    def _push_scalar(self, key: str, snapshot: Dict[str, Any], panel) -> None:
+        if key == 'b_temp':
+            value = snapshot.get('skin_temp')
+            # 肤温没有效值时上报的是 0.0，不是 None；人体肤温不可能 ≤0，据此判无效
+            if value is not None and float(value) <= 0:
+                value = None
+            curve = '肤温'
+        else:
+            battery = snapshot.get('battery') or {}
+            value = battery.get('percent')
+            if value is None:
+                value = battery.get('电量')
+            curve = '电量'
+        if value is None:
+            panel.set_value('--')
+            return
+        hist = self._scalar_hist[key]
+        hist.append(float(value))
+        series = list(hist)
+        panel.set_series(curve, series, 1.0, end_time=float(len(series)))
+        # 单位由标题右侧的 unit_label 显示，这里只放数字，否则会变成 "98.0% %"
+        panel.set_value('{:.1f}'.format(series[-1]))
+
+    def _update_camera_preview(self, snapshot: Dict[str, Any]) -> None:
+        import cv2
+        frame = snapshot.get('camera_frame')
+        if frame is None and self.window_ref.camera_service is not None:
+            frame = self.window_ref.camera_service.latest_frame()
+        if not frame:
+            return
+        jpeg, index, _stamp = frame
+        now = time.time()
+        if index == getattr(self, '_camera_index', None) and \
+                now - getattr(self, '_camera_at', 0.0) < 0.15:
+            return
+        image = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        if image is None:
+            return
+        self._camera_index = index
+        self._camera_at = now
+        rgb = np.ascontiguousarray(image[:, :, ::-1])
+        height, width, _ = rgb.shape
+        qimage = QImage(rgb.data, width, height, 3 * width, QImage.Format_RGB888).copy()
+        self.preview_camera.setPixmap(QPixmap.fromImage(qimage).scaled(
+            max(64, self.preview_camera.width() - 4),
+            max(64, self.preview_camera.height() - 4),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def on_tick(self, snapshot: Dict[str, Any]) -> None:
+        player = self.window_ref.replay
+        if player is not None and player.is_alive():
+            position, total, fraction = player.progress()
+            self.play_info.setText('第 {}/{} 包 · {:.0f}% · {:g}x'.format(
+                position + 1, total, fraction * 100.0, player.speed))
 
 
 class CameraPage(BasePage):
@@ -1178,6 +1347,10 @@ class CameraPage(BasePage):
         # 模型在「开始采集」之后才加载，避免没开摄像头就先占显存。
         yawn_row = QHBoxLayout()
         self.yawn_check = QCheckBox('启用打哈欠检测')
+        self.yawn_check.setToolTip(
+            '只识别画面中间那一个人：脸中心落在中间 50% 宽度内才计入，\n'
+            '旁边的人（同事、路过的人）不会被当成被试。\n'
+            '宽度可在 config.ini 的 [vision] center_band 调整。')
         self.yawn_check.toggled.connect(self._on_yawn_toggled)
         yawn_row.addWidget(self.yawn_check)
         yawn_row.addStretch(1)
@@ -1429,9 +1602,11 @@ class MonitorWindow(QMainWindow):
         self.stage_stack = QStackedWidget()
         self.stage_stack.addWidget(self._build_acquisition_stage())
         self.status_page = self._page_by_class('StatusPage')
+        self.playback_page = self._page_by_class('PlaybackPage')
         self.analysis_page = self._page_by_class('AnalysisPage')
-        self.stage_stack.addWidget(self.status_page or QWidget())
-        self.stage_stack.addWidget(self.analysis_page or QWidget())
+        # 顺序必须与 STAGE_SPECS 一致：采集 / 选段 / 观看 / 分析
+        for page in (self.status_page, self.playback_page, self.analysis_page):
+            self.stage_stack.addWidget(page or QWidget())
         layout.addWidget(self.stage_stack, 1)
 
         layout.addWidget(self._build_wizard_bar())
@@ -1619,7 +1794,8 @@ class MonitorWindow(QMainWindow):
         if stage == 1 and self.status_page is not None:
             # 新录的会话库要刷新一次下拉，否则刚采完的数据看不见。
             # 包一层 try：某个库损坏/被占用时，不能把"切阶段"这件事一起带崩。
-            refresh = getattr(self.status_page, '_refresh_sessions', None)
+            refresh = (getattr(self.status_page, '_reload_sessions', None)
+                       or getattr(self.status_page, '_refresh_sessions', None))
             if callable(refresh):
                 try:
                     refresh()
@@ -1643,8 +1819,19 @@ class MonitorWindow(QMainWindow):
                 self.status_page.confirm_selection()
             return
         if stage == 2:
+            self.goto_analysis()
+            return
+        if stage == 3:
             self._finish_flow()
             return
+
+    def goto_analysis(self) -> None:
+        """从「回放观看」进入「数据分析」：把选区交给分析页并解锁。"""
+        page = getattr(self, 'analysis_page', None)
+        if page is not None and hasattr(page, 'adopt_selection'):
+            page.adopt_selection()
+        self.mark_stage_done(2)
+        self.goto_stage(3)
 
     def goto_prev(self) -> None:
         if self.stage > 0 and self.can_enter(self.stage - 1):
@@ -1707,13 +1894,17 @@ class MonitorWindow(QMainWindow):
                 self.next_button.setText('跳过采集并继续')
             self.next_button.setEnabled(True)
         elif self.stage == 1:
-            self.stage_hint.setText('选会话 → 拖出区间（或点「自动选区」）→ 下一步')
+            self.stage_hint.setText('选人员 → 选任务 → 拖出区间（或点「自动选区」）→ 进入回放')
+            self.next_button.setText('进入回放观看')
+            self.next_button.setEnabled(True)
+        elif self.stage == 2:
+            self.stage_hint.setText('画面会自动播放选中的片段；看完点下一步')
             self.next_button.setText('下一步：数据分析')
             self.next_button.setEnabled(True)
         else:
-            self.stage_hint.setText('勾选模型后点「特征提取」；跑完即可完成')
+            self.stage_hint.setText('选好模型后点「特征提取」；跑完即可完成')
             self.next_button.setText('完成')
-            self.next_button.setEnabled(self.stage_done.get(2, False))
+            self.next_button.setEnabled(self.stage_done.get(3, False))
 
     def switch_page(self, index: int) -> None:
         """兼容层：旧的「按扁平下标切页」调用仍可用（截图工具、回看分支在用）。
@@ -1729,10 +1920,15 @@ class MonitorWindow(QMainWindow):
             self.acq_tabs.setCurrentWidget(page)
 
     def start_replay(self, path: str, speed: float = 1.0,
-                     include: Optional[List[str]] = None) -> int:
-        """载入并回放。`include` 指定只回放哪几路数据（见 ui/replay.py 的 REPLAY_SOURCES）。"""
+                     include: Optional[List[str]] = None,
+                     time_range: Optional[Tuple[float, float]] = None) -> int:
+        """载入并回放。
+
+        `include` 指定只回放哪几路数据（见 ui/replay.py 的 REPLAY_SOURCES）；
+        `time_range` 给定时只放这一段（回放观看页用它播选定片段）。
+        """
         self.stop_replay()
-        packets = load_packets(path, include=include)
+        packets = load_packets(path, include=include, time_range=time_range)
         self.replay = ReplayPlayer(packets, self.buffers, speed=speed)
         self.replay.start()
         page = getattr(self, 'status_page', None)
@@ -1825,6 +2021,7 @@ class MonitorWindow(QMainWindow):
             dip_grace_sec=getattr(cfg, 'vision_dip_grace', 0.3),
             face_backend=getattr(cfg, 'vision_backend', 'auto'),
             face_conf=getattr(cfg, 'vision_face_conf', 0.35),
+            center_band=getattr(cfg, 'vision_center_band', 0.25),
             on_event=self._write_yawn_event,
         )
         self.yawn_monitor = monitor

@@ -286,6 +286,113 @@ def _collect_ppg(packets, start: float, end: float,
     return values, stamps
 
 
+# ---------------------------------------------------------------------------
+# 皮肤电（EDA / GSR）
+# ---------------------------------------------------------------------------
+
+def _quant_step(arr: np.ndarray) -> float:
+    """估信号的量化阶（最小非零相邻差）。全常数返回 0。"""
+    diff = np.abs(np.diff(np.unique(arr)))
+    diff = diff[diff > 1e-12]
+    return float(diff.min()) if diff.size else 0.0
+
+
+def extract_eda(gsr: Sequence[float], fs: float,
+                duration: Optional[float] = None
+                ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """皮肤电特征（只依赖 numpy）。
+
+    没有 scipy，所以不做完整的 EDA 分解：用 1 秒滑动均值近似 tonic（皮肤电导水平
+    SCL），再从「快变分量」里数皮肤电反应（SCR）的峰。
+
+    **单位说明**：设备给的是未标定的原始刻度（实测 0~2.3，量化阶 0.001），
+    没有 μS 换算系数，所以这里的数值一律标「原始刻度」，不冒充物理单位。
+
+    质量闸门用相对量：很多会话的皮电全程恒定（实测 9 个库里 3 个只有 1~2 个
+    不同取值），绝对阈值会把正常的弱信号也判死。
+    """
+    arr = np.asarray(gsr, dtype=float)
+    if arr.size == 0:
+        return None, '区间内没有皮电数据'
+    if not np.isfinite(arr).all():
+        bad = float(np.mean(~np.isfinite(arr)))
+        if bad > 0.01:
+            return None, '皮电含无效值（{:.0%}）'.format(bad)
+        arr = arr[np.isfinite(arr)]
+    if arr.size < 20:
+        return None, '皮电数据太短（{} 个点，至少需要 20 秒）'.format(arr.size)
+
+    span = float(np.percentile(arr, 99.5) - np.percentile(arr, 0.5))
+    step = _quant_step(arr)
+    if step > 0 and span < 2.0 * step:
+        return None, '皮电无变化（全程恒定，可能未贴合或未标定）'
+    unique = int(np.unique(arr).size)
+    if unique < 5:
+        return None, '皮电几乎恒定（只有 {} 个不同取值）'.format(unique)
+
+    if duration is None or duration <= 0:
+        duration = arr.size / max(fs, 1e-6)
+
+    fs = float(fs)
+    # tonic ≈ 1 秒滑动均值；phasic = 原始 - tonic
+    tonic = _moving_average(arr, max(2, int(fs * 1.0)))
+    phasic = arr - tonic
+    # SCR：0.05~0.5Hz 的快变分量（一次皮肤电反应通常 1~3 秒上升）
+    fast = bandpass_emph(arr, fs, fast_sec=1.5, slow_sec=10.0)
+    peaks = find_peaks(fast, fs, min_interval_sec=1.5, rel_threshold=0.5)
+
+    seconds = np.arange(arr.size) / max(fs, 1e-6)
+    slope = 0.0
+    if arr.size >= 4:
+        try:
+            slope = float(np.polyfit(seconds / 60.0, arr, 1)[0])   # 每分钟变化量
+        except (np.linalg.LinAlgError, ValueError):
+            slope = 0.0
+
+    amplitude = None
+    peak_max = None
+    if peaks.size:
+        values = np.abs(fast[peaks])
+        amplitude = round(float(values.mean()), 4)
+        peak_max = round(float(values.max()), 4)
+
+    features: Dict[str, Any] = {
+        '皮电均值': round(float(arr.mean()), 4),
+        '基线(SCL)': round(float(np.median(arr)), 4),
+        '动态范围': round(span, 4),
+        '标准差': round(float(arr.std(ddof=1)) if arr.size > 1 else 0.0, 4),
+        '斜率(/分)': round(slope, 4),
+        '反应次数(SCR)': int(peaks.size),
+        '相位功率': round(float(np.mean(fast ** 2)), 6),
+    }
+    if duration >= 20.0:
+        features['反应频率(次/分)'] = round(peaks.size * 60.0 / duration, 2)
+    if amplitude is not None:
+        features['反应幅度均值'] = amplitude
+        features['反应幅度峰值'] = peak_max
+    return features, 'ok'
+
+
+# ---------------------------------------------------------------------------
+# 统一的 block 结构
+# ---------------------------------------------------------------------------
+
+def _block(ok: bool, note: str, features: Optional[Dict[str, Any]] = None,
+           fs: Optional[float] = None, points: Optional[int] = None,
+           status: Optional[str] = None) -> Dict[str, Any]:
+    """一路信号的统一结果块。
+
+    所有出口都走这里，避免出现"早退分支少了 采样率/采样点 键，界面取值时 KeyError"。
+    """
+    return {
+        '状态': status or ('ok' if ok else 'n/a'),
+        '说明': note,
+        '特征': features or {},
+        '采样率': None if fs is None else round(float(fs), 1),
+        '采样点': 0 if points is None else int(points),
+    }
+
+
 def analyze_packets(packets, start: Optional[float] = None,
                     end: Optional[float] = None) -> Dict[str, Any]:
     """对一段会话数据做特征提取。
@@ -295,42 +402,62 @@ def analyze_packets(packets, start: Optional[float] = None,
 
         {
           '区间': (start, end, 时长秒),
-          '心电': {'状态': 'ok'|'n/a', '说明': str, '特征': {...}},
-          '手环PPG': {...},
-          '眼动':   {'状态': 'n/a', '说明': '眼动仪未接入'},
-          '表情':   {'状态': 'n/a', '说明': 'YOLO 模型未接入'},
+          '心电':    {'状态': 'ok'|'n/a', '说明': str, '特征': {...}, '采样率', '采样点'},
+          '手环PPG': {...同构...},
+          '皮电GSR': {...同构，数值为原始刻度...},
+          '眼动':    {'状态': 'n/a', '说明': '眼动仪未接入'},
+          '表情':    {'状态': 'n/a', '说明': 'YOLO 模型未接入'},
         }
     """
     if not packets:
-        return {'区间': (0, 0, 0), '心电': {'状态': 'n/a', '说明': '没有数据'},
-                '手环PPG': {'状态': 'n/a', '说明': '没有数据'},
-                '眼动': {'状态': 'n/a', '说明': '眼动仪未接入'},
-                '表情': {'状态': 'n/a', '说明': '表情模型未接入'}}
+        return {'区间': (0, 0, 0),
+                '心电': _block(False, '没有数据'),
+                '手环PPG': _block(False, '没有数据'),
+                '皮电GSR': _block(False, '没有数据'),
+                '眼动': _block(False, '眼动仪未接入'),
+                '表情': _block(False, '表情模型未接入')}
 
     first = packets[0][0]
     last = packets[-1][0]
     start = first if start is None else max(first, start)
     end = last if end is None else min(last, end)
     if end <= start:
-        return {'区间': (start, end, 0), '心电': {'状态': 'n/a', '说明': '时间区间为空'},
-                '手环PPG': {'状态': 'n/a', '说明': '时间区间为空'},
-                '眼动': {'状态': 'n/a', '说明': '眼动仪未接入'},
-                '表情': {'状态': 'n/a', '说明': '表情模型未接入'}}
+        return {'区间': (start, end, 0),
+                '心电': _block(False, '时间区间为空'),
+                '手环PPG': _block(False, '时间区间为空'),
+                '皮电GSR': _block(False, '时间区间为空'),
+                '眼动': _block(False, '眼动仪未接入'),
+                '表情': _block(False, '表情模型未接入')}
 
     result: Dict[str, Any] = {'区间': (start, end, end - start)}
 
     ecg, ecg_ts = _collect(packets, 'ecg', ('ECG', 'ECG'), start, end)
     ecg_fs = estimate_fs(ecg_ts, len(ecg), fallback=250.0)
     hrv, note = extract_hrv(ecg, ecg_fs) if ecg else (None, '区间内没有心电数据')
-    result['心电'] = {'状态': 'ok' if hrv else 'n/a', '说明': note,
-                      '特征': hrv or {}, '采样率': round(ecg_fs, 1), '采样点': len(ecg)}
+    result['心电'] = _block(bool(hrv), note, hrv, ecg_fs, len(ecg))
 
     ppg, ppg_ts = _collect_ppg(packets, start, end)
     ppg_fs = estimate_fs(ppg_ts, len(ppg), fallback=250.0)
     pulse, pulse_note = extract_pulse(ppg, ppg_fs) if ppg else (None, '区间内没有 PPG 数据')
-    result['手环PPG'] = {'状态': 'ok' if pulse else 'n/a', '说明': pulse_note,
-                         '特征': pulse or {}, '采样率': round(ppg_fs, 1), '采样点': len(ppg)}
+    result['手环PPG'] = _block(bool(pulse), pulse_note, pulse, ppg_fs, len(ppg))
 
-    result['眼动'] = {'状态': 'n/a', '说明': '眼动仪未接入（预留）', '特征': {}}
-    result['表情'] = {'状态': 'n/a', '说明': '表情模型未接入（预留 YOLO）', '特征': {}}
+    # 皮电：packets 里是 `('bracelet', {'GSR': [每包 10 个值]})`，
+    # _collect 会把 list 展平成一条序列；每个包只记一次时间戳，
+    # 所以采样率要用「样本数 / 首末包跨度」估，跨度用时间戳而不是 len/fs。
+    gsr, gsr_ts = _collect(packets, 'bracelet', ('GSR',), start, end)
+    gsr_fs = estimate_fs(gsr_ts, len(gsr), fallback=10.0)
+    gsr_seconds = (float(gsr_ts[-1]) - float(gsr_ts[0])) + 1.0 if len(gsr_ts) > 1 else 0.0
+    if gsr and not (8.0 <= gsr_fs <= 12.0):
+        # estimate_fs 把 10.0 当下界，1Hz 的数据会被静默回退成 10Hz，
+        # 后续所有时间常数差 10 倍 —— 宁可报 n/a 也不出错误数字。
+        result['皮电GSR'] = _block(
+            False, '皮电采样率异常（估到 {:.1f} Hz，期望约 10 Hz）'.format(gsr_fs),
+            None, gsr_fs, len(gsr))
+    else:
+        eda, eda_note = (extract_eda(gsr, gsr_fs, gsr_seconds) if gsr
+                         else (None, '区间内没有皮电数据'))
+        result['皮电GSR'] = _block(bool(eda), eda_note, eda, gsr_fs, len(gsr))
+
+    result['眼动'] = _block(False, '眼动仪未接入（预留）')
+    result['表情'] = _block(False, '表情模型未接入（预留 YOLO）')
     return result

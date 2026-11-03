@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import QDateTime, Qt
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDateTimeEdit, QFileDialog, QHBoxLayout,
                              QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
                              QVBoxLayout, QWidget)
@@ -22,7 +23,8 @@ from analysis.features import analyze_packets
 from core.config import DATA_DIR, Config
 from ui import theme
 from ui.base import BasePage
-from ui.replay import format_size, list_sessions, load_packets, load_yawn_events
+from ui.replay import (format_size, list_session_folders, list_sessions,
+                       load_packets, load_yawn_events)
 from ui.widgets import Card, StatTile, label, mono
 
 
@@ -95,10 +97,10 @@ class RecognizePage(BasePage):
     subtitle = ''
 
     MODELS = [
-        ('load', '负荷等级', '低 / 中 / 高'),
-        ('emotion', '情绪状态', '正性 / 中性 / 负性'),
-        ('fatigue', '疲劳程度', '清醒 / 轻度 / 重度'),
-        ('attention', '注意水平', '专注 / 分心'),
+        ('fatigue', '疲劳状态', '清醒 / 轻度 / 重度'),
+        ('emotion', '异常情绪', '正常 / 异常'),
+        ('behavior', '异常行为', '正常 / 异常'),
+        ('illusion', '错觉', '未检出 / 检出'),
     ]
 
     def build(self) -> None:
@@ -165,41 +167,57 @@ class AnalysisPage(BasePage):
     title = '数据分析'
     subtitle = ''
 
-    # (界面名, key)。available=False 的只占位，选中后执行按钮禁用。
+    # (界面名, key, 是否可用, 说明)。单选：一次只分析一个模型。
+    # 前四项是待接入的识别模型（没有权重文件），选中即说明未接入，不做假结果；
+    # 最后一项是纯规则计算，不需要模型文件，也是目前唯一能真正出结果的。
     MODELS = [
-        ('HRV / 脉搏特征', 'hrv', True, '规则计算（bpm / SDNN / RMSSD / LF / HF），不需要模型文件'),
-        ('疲劳 · 打哈欠', 'fatigue', True, '统计录制时实时检测写入的哈欠事件（需开启打哈欠检测）'),
-        ('负荷等级', 'load', False, '未接入：缺少模型权重'),
-        ('情绪状态', 'emotion', False, '未接入：缺少模型权重'),
-        ('注意水平', 'attention', False, '未接入：缺少模型权重'),
+        ('疲劳状态', 'fatigue', False, '未接入：缺少疲劳模型权重'),
+        ('异常情绪', 'emotion', False, '未接入：缺少情绪模型权重'),
+        ('异常行为', 'behavior', False, '未接入：缺少行为模型权重'),
+        ('错觉', 'illusion', False, '未接入：缺少错觉模型权重'),
+        ('生理指标分析', 'physio', True,
+         '心电 HRV + 脉搏 PPG + 皮电 GSR，规则计算，不需要模型文件'),
     ]
+    DEFAULT_MODEL = 'physio'
+
+    # 生理指标分析覆盖的三路信号（顺序即结果表的显示顺序）
+    SECTIONS = ('心电', '手环PPG', '皮电GSR')
 
     def build(self) -> None:
         self.packets: List[tuple] = []
         self.bound: Tuple[float, float] = (0.0, 0.0)
         self.last_result: Optional[Dict[str, Any]] = None
 
-        # 分析模型：先把"选哪个"的架子搭起来。
-        # 目前只有 HRV/脉搏特征是真正能算的（纯规则，不需要模型文件）；
-        # 其余四个模型没有权重，选中就明确禁用执行按钮，不做假结果。
+        # 分析模型：单选下拉，一次只跑一个。
+        # 注意：addItem 会立刻发出 currentIndexChanged，而这时下面的提示、按钮、
+        # 结果表都还没建 —— 所以信号连接放到 build() 末尾统一接。
         model_row = QHBoxLayout()
-        model_row.setSpacing(12)
+        model_row.setSpacing(8)
         model_row.addWidget(label('分析模型', 'Dim'))
-        self.model_boxes: Dict[str, Any] = {}
+        self.model_combo = QComboBox()
+        self.model_combo.setMinimumWidth(theme.scaled(220))
         for text, key, available, hint in self.MODELS:
-            box = QCheckBox(text)
-            box.setToolTip(hint)
-            box.setChecked(key == 'hrv')          # 默认只勾真正能算的那个
-            if not available:
-                box.setStyleSheet('color: #8A8A8A;')   # 可见但灰显：表示存在、尚未接入
-            box.stateChanged.connect(self._sync_model)
-            self.model_boxes[key] = box
-            model_row.addWidget(box)
+            self.model_combo.addItem(text, key)
+            index = self.model_combo.count() - 1
+            self.model_combo.setItemData(index, hint, Qt.ToolTipRole)
+            if not available:                     # 未接入的灰显，但可选（选了会说明原因）
+                self.model_combo.setItemData(index, QColor('#8A8A8A'), Qt.ForegroundRole)
+        self.model_combo.setCurrentIndex(
+            max(0, self.model_combo.findData(self.DEFAULT_MODEL)))
+        model_row.addWidget(self.model_combo)
         model_row.addStretch(1)
         self.content.addLayout(model_row)
         self.model_hint = mono('')
         self.model_hint.setWordWrap(True)
         self.content.addWidget(self.model_hint)
+
+        folder_bar = QHBoxLayout()
+        folder_bar.setSpacing(6)
+        folder_bar.addWidget(label('人员', 'Dim'))
+        self.folder_combo = QComboBox()
+        self.folder_combo.currentIndexChanged.connect(self.refresh_sessions)
+        folder_bar.addWidget(self.folder_combo, 1)
+        self.content.addLayout(folder_bar)
 
         bar = QHBoxLayout()
         bar.setSpacing(6)
@@ -270,7 +288,7 @@ class AnalysisPage(BasePage):
         tiles = QHBoxLayout()
         tiles.setSpacing(6)
         for key, name, unit in (('hr', '心率', 'bpm'), ('pulse', '脉率', 'bpm'),
-                                ('sdnn', 'SDNN', 'ms'), ('lf_hf', 'LF/HF', '')):
+                                ('sdnn', 'SDNN', 'ms'), ('scl', '皮电 SCL', '原始')):
             tile = StatTile(name, unit, '--', theme.PALETTE['red'], '')
             self.tiles[key] = tile
             tiles.addWidget(tile, 1)
@@ -280,32 +298,83 @@ class AnalysisPage(BasePage):
         self.content.addLayout(body, 1)
 
         self.refresh_sessions()
+        # 信号必须放在最后接：下拉框在 addItem/setCurrentIndex 期间就会发
+        # currentIndexChanged，而槽函数要读 model_hint / extract_button。
+        self.model_combo.currentIndexChanged.connect(self._sync_model)
         self._sync_model()
 
     # ------------------------------------------------------------------
     def refresh_sessions(self) -> None:
+        self._refresh_folders()
+        folder = self.folder_combo.currentData() if hasattr(self, 'folder_combo') else None
+        if folder == '__root__':
+            sources = list_sessions(DATA_DIR, recursive=False)
+        elif folder:
+            sources = list_sessions(DATA_DIR, folder=folder)
+        else:
+            sources = list_sessions(DATA_DIR)
         self.session_combo.clear()
-        for path, mtime, size in list_sessions(DATA_DIR):
+        for path, mtime, size in sources:
             stamp = datetime.fromtimestamp(mtime).strftime('%m-%d %H:%M')
             self.session_combo.addItem(
                 f'{os.path.basename(path)}   {stamp}   {format_size(size)}', path)
         if self.session_combo.count() == 0:
             self.session_combo.addItem('（data/ 下没有会话文件）', None)
 
-    def _checked_models(self) -> List[Tuple[str, str, bool, str]]:
-        return [spec for spec in self.MODELS if self.model_boxes[spec[1]].isChecked()]
+    def _current_spec(self) -> Tuple[str, str, bool, str]:
+        """当前菜单项 (界面名, key, 是否可用, 说明)。"""
+        index = self.model_combo.currentIndex()
+        if index < 0:
+            return self.MODELS[-1]
+        return self.MODELS[index]
+
+    def _current_key(self) -> str:
+        return self._current_spec()[1]
 
     def _sync_model(self) -> None:
-        if not hasattr(self, 'extract_button'):       # 建界面过程中信号会先到
+        """只更新提示与按钮可用性 —— 不碰结果表。
+
+        切换下拉时若顺手清空结果，用户从「生理指标分析」切到别项再切回来，
+        上一次的结果就白跑了（导出按钮也一起废掉）。
+        """
+        if not hasattr(self, 'model_hint') or not hasattr(self, 'extract_button'):
+            return                                  # 建界面过程中信号会先到
+        text, _key, available, hint = self._current_spec()
+        if available:
+            self.model_hint.setText('{}：{}'.format(text, hint))
+            self.model_hint.setStyleSheet('')
+        else:
+            note = '{}：{}'.format(text, hint)
+            if self.last_result:
+                # 切到未接入项时不清结果（切回来还得重跑大库），但要说清楚
+                # 表里那些数字不是这个模型算的
+                note += '（结果区仍是上一次分析，点「特征提取」会提示未接入）'
+            self.model_hint.setText(note)
+            self.model_hint.setStyleSheet('color: #A0522D;')
+        self.extract_button.setEnabled(available)
+
+    def _show_unavailable(self, text: str, hint: str) -> None:
+        """选中未接入的模型：结果区明确说明，不留上一次的旧结果。"""
+        self._fill_rows([('【{}】'.format(text), '未接入', hint)])
+        for tile in self.tiles.values():
+            tile.set_value('--')
+        self.last_result = None
+        self.export_button.setEnabled(False)
+        self.range_hint.setText('{} 未接入'.format(text))
+
+    def _refresh_folders(self) -> None:
+        if not hasattr(self, 'folder_combo'):
             return
-        checked = self._checked_models()
-        if not checked:
-            self.model_hint.setText('至少勾选一个模型')
-            self.extract_button.setEnabled(False)
-            return
-        names = [spec[0] if spec[2] else spec[0] + '（未接入）' for spec in checked]
-        self.model_hint.setText('已选：' + '、'.join(names))
-        self.extract_button.setEnabled(any(spec[2] for spec in checked))
+        current = self.folder_combo.currentData()
+        self.folder_combo.blockSignals(True)
+        self.folder_combo.clear()
+        self.folder_combo.addItem('全部人员', None)
+        for name, _count in list_session_folders(DATA_DIR):
+            self.folder_combo.addItem('未分类', '__root__') if not name \
+                else self.folder_combo.addItem(name, name)
+        index = self.folder_combo.findData(current)
+        self.folder_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.folder_combo.blockSignals(False)
 
     def _sync_range_enabled(self) -> None:
         enabled = self.use_range.isChecked()
@@ -369,47 +438,50 @@ class AnalysisPage(BasePage):
 
     # ------------------------------------------------------------------
     def run_analysis(self) -> None:
-        """按勾选的模型逐个跑，结果按块拼进同一张表。"""
-        checked = self._checked_models()
-        if not checked:
-            self.range_hint.setText('至少勾选一个分析模型')
+        """按菜单里选中的那一个模型跑。"""
+        text, key, available, hint = self._current_spec()
+        if not available:
+            self._show_unavailable(text, hint)
             return
-        # 只有 HRV 需要载入采样包；疲劳模型读的是事件表，不该被这个门槛挡住
-        if any(spec[1] == 'hrv' for spec in checked) and not self.packets:
+        if not self.packets:
             self.load_selected()
             if not self.packets:
                 return
         start, end = self._selected_range()
 
-        rows: List[Tuple[str, str, str]] = []
-        for text, key, available, hint in checked:
-            if key == 'hrv' and available:
-                result = analyze_packets(self.packets, start, end)
-                self.last_result = result
-                rows.extend(self._hrv_rows(result))
-            elif key == 'fatigue' and available:
-                rows.extend(self._fatigue_rows(start, end))
-            else:
-                rows.append(('【{}】'.format(text), '未接入', hint))
+        result = analyze_packets(self.packets, start, end)
+        self.last_result = result
+        rows = self._physio_rows(result)
         self._fill_rows(rows)
         self.export_button.setEnabled(bool(self.last_result))
-        if rows:                       # 真的产出了结果才算"分析完成"
+
+        # 只有真的算出至少一路指标才算"分析完成"。
+        # 只跑未接入的模型、或三路全部 n/a，都不该点亮第 4 段。
+        ok = any((result.get(section) or {}).get('状态') == 'ok'
+                 for section in self.SECTIONS)
+        if ok:
             mark = getattr(self.window_ref, 'mark_stage_done', None)
             if callable(mark):
-                mark(2)
+                mark(3)
+        else:
+            self.range_hint.setText('三路信号都没有算出指标，看结果表的「说明」')
 
     def reset_results(self) -> None:
         """回退到回放段重新选段时，把上一次的结果清掉，避免看起来还有效。"""
         self.result_table.setRowCount(0)
+        for tile in self.tiles.values():
+            tile.set_value('--')
         self.last_result = None
         self.packets = []
         self.export_button.setEnabled(False)
         self.range_hint.setText('尚未载入会话')
 
-    def _hrv_rows(self, result: Dict[str, Any]) -> List[Tuple[str, str, str]]:
-        span = result['区间'][2]
-        rows: List[Tuple[str, str, str]] = [('分析时长', '{:.1f} 秒'.format(span), '选定区间')]
-        for section in ('心电', '手环PPG', '眼动', '表情'):
+    def _physio_rows(self, result: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+        """生理指标分析的结果行：心电 / 脉搏 / 皮电三路。"""
+        span = (result.get('区间') or (0, 0, 0))[2]
+        rows: List[Tuple[str, str, str]] = [
+            ('分析时长', '{:.1f} 秒'.format(span), '选定区间')]
+        for section in self.SECTIONS:
             block = result.get(section) or {}
             rows.append(('【{}】'.format(section), block.get('状态', 'n/a'),
                          block.get('说明', '')))
@@ -418,10 +490,11 @@ class AnalysisPage(BasePage):
                              'n/a' if value is None else str(value), ''))
         ecg = (result.get('心电') or {}).get('特征') or {}
         ppg = (result.get('手环PPG') or {}).get('特征') or {}
+        gsr = (result.get('皮电GSR') or {}).get('特征') or {}
         self.tiles['hr'].set_value(str(ecg.get('bpm', '--')))
         self.tiles['pulse'].set_value(str(ppg.get('脉率', '--')))
         self.tiles['sdnn'].set_value(str(ecg.get('sdnn', '--')))
-        self.tiles['lf_hf'].set_value(str(ecg.get('lf/hf', '--')))
+        self.tiles['scl'].set_value(str(gsr.get('基线(SCL)', '--')))
         return rows
 
     def _fatigue_rows(self, start, end) -> List[Tuple[str, str, str]]:
@@ -470,8 +543,10 @@ class AnalysisPage(BasePage):
         path, _filter = QFileDialog.getSaveFileName(self, '导出特征', default, 'CSV (*.csv)')
         if not path:
             return
-        rows = []
-        for section in ('心电', '手环PPG', '眼动', '表情'):
+        # 数据驱动：遍历结果里所有的信号块，下次新增一路不会漏导
+        rows = [['区间', '分析时长', '{:.1f} 秒'.format(
+            (self.last_result.get('区间') or (0, 0, 0))[2]), '']]
+        for section in self.SECTIONS:
             block = self.last_result.get(section) or {}
             for name, value in (block.get('特征') or {}).items():
                 rows.append([section, name, '' if value is None else value,

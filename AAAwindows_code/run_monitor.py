@@ -39,6 +39,7 @@ def _preload_vision_runtime() -> None:
     崩溃点固定在 `onnxruntime/capi/_pybind_state.py` 加载 DLL 的那一行。
     所以这段必须放在文件最前面，`core.preflight`（会 import cv2/PyQt5）之前。
 
+
     未安装这些包时静默跳过 —— 打哈欠检测是可选功能，缺了不影响采集。
     """
     try:
@@ -218,7 +219,7 @@ def main(argv: Optional[list] = None) -> int:
     writer.start()
 
     if profile is not None:
-        print('[会话] {} / {} · {}'.format(profile.group, profile.name,
+        print('[会话] {} / {} · {}'.format(profile.name, profile.task,
                                           profile.started_at.strftime('%Y-%m-%d %H:%M:%S')),
               flush=True)
     print('[存储] ' + storage.db_path, flush=True)
@@ -248,12 +249,14 @@ def main(argv: Optional[list] = None) -> int:
             'db_path': storage.db_path,
             'source': ('回看历史' if review_only else
                        ('回放' if args.replay else ('仅界面' if args.no_ble else '实时蓝牙'))),
-            'subject': '{} / {}'.format(profile.name, profile.group) if profile else '临时会话',
+            'subject': '{} / {}'.format(profile.name, profile.task) if profile else '临时会话',
             'server': '{}:{}'.format(profile.server_host, cfg.server_port) if profile
                       else '{}:{}'.format(cfg.server_host, cfg.server_port),
             # 启动时勾的测量工具决定注册哪些页面；没勾就不出现在导航里
             'devices': tuple(profile.devices) if profile else ('ecg', 'bracelet', 'camera'),
             'review_only': review_only,
+            # 'ground' 地面（本机）| 'host' 上机（上位机），登录界面选的
+            'host_mode': profile.host_mode if profile else 'ground',
         },
         writer=writer,
         status=status,

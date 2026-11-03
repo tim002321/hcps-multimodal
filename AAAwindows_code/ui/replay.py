@@ -278,7 +278,8 @@ def _load_groups(conn: sqlite3.Connection, table: str) -> Dict[str, List[Any]]:
 
 
 def load_db_packets(db_path: str, limit_seconds: Optional[float] = None,
-                    include: Optional[Any] = None
+                    include: Optional[Any] = None,
+                    time_range: Optional[Tuple[float, float]] = None
                     ) -> List[Tuple[float, str, Dict[str, Any]]]:
     """从采集数据库重建 [(epoch, 'ecg'|'bracelet'|'camera', decoded)]。
 
@@ -348,6 +349,9 @@ def load_db_packets(db_path: str, limit_seconds: Optional[float] = None,
                         {'jpeg': jpeg, 'frame_index': frame_index, 'time': ts}))
 
     packets.sort(key=lambda item: item[0])
+    if time_range:
+        start, end = time_range
+        packets = [item for item in packets if start <= item[0] <= end]
     if limit_seconds and packets:
         cutoff = packets[0][0] + limit_seconds
         packets = [item for item in packets if item[0] <= cutoff]
@@ -355,7 +359,8 @@ def load_db_packets(db_path: str, limit_seconds: Optional[float] = None,
 
 
 def load_jsonl_packets(path: str, limit_seconds: Optional[float] = None,
-                       include: Optional[Any] = None
+                       include: Optional[Any] = None,
+                       time_range: Optional[Tuple[float, float]] = None
                        ) -> List[Tuple[float, str, Dict[str, Any]]]:
     """从 JSONL（每行 {'time','device','data'}）重建心电包。"""
     if include is not None and 'ecg' not in set(include):
@@ -371,6 +376,9 @@ def load_jsonl_packets(path: str, limit_seconds: Optional[float] = None,
             except json.JSONDecodeError:
                 continue
             packets.append((_to_epoch(record.get('time', '')), 'ecg', record.get('data') or {}))
+    if time_range:
+        start, end = time_range
+        packets = [item for item in packets if start <= item[0] <= end]
     if limit_seconds and packets:
         cutoff = packets[0][0] + limit_seconds
         packets = [item for item in packets if item[0] <= cutoff]
@@ -421,11 +429,16 @@ def load_yawn_events(db_path: str, start: Optional[float] = None,
 
 
 def load_packets(path: str, limit_seconds: Optional[float] = None,
+                 include: Optional[Any] = None,
+                 time_range: Optional[Tuple[float, float]] = None):
+    """按内容/时间范围载入回放包。
 
-                 include: Optional[Any] = None):
+    `time_range=(起, 止)`（epoch 秒）给定时只载这一段 —— 回放观看页播的就是它。
+    """
     if path.lower().endswith('.jsonl'):
-        return load_jsonl_packets(path, limit_seconds, include=include)
-    return load_db_packets(path, limit_seconds, include=include)
+        return load_jsonl_packets(path, limit_seconds, include=include,
+                                  time_range=time_range)
+    return load_db_packets(path, limit_seconds, include=include, time_range=time_range)
 
 
 def format_size(size: Optional[int]) -> str:
@@ -445,18 +458,39 @@ def format_size(size: Optional[int]) -> str:
     return '{} B'.format(int(size))
 
 
+def list_session_folders(data_dir: str) -> List[Tuple[str, int]]:
+    """列出 data/ 下有会话的一级文件夹：[(文件夹名, 会话数)]。
+
+    第一个人是人员姓名目录（`data/张三/任务A_20261103_101010/xxx.db`），
+    直接放在 data/ 根下的旧会话归到 ''（界面显示成「未分类」）。
+    返回值按"有名字的在前、根目录最后"排序。
+    """
+    counts: Dict[str, int] = {}
+    for root, _dirs, files in os.walk(data_dir):
+        found = sum(1 for name in files if name.lower().endswith('.db'))
+        if not found:
+            continue
+        rel = os.path.relpath(root, data_dir)
+        top = '' if rel == '.' else rel.replace('\\', '/').split('/')[0]
+        counts[top] = counts.get(top, 0) + found
+    return sorted(counts.items(), key=lambda item: (item[0] == '', item[0]))
+
+
 def list_sessions(data_dir: str, recursive: bool = True,
-                  skip_empty: bool = True) -> List[Tuple[str, float, int]]:
+                  skip_empty: bool = True,
+                  folder: Optional[str] = None) -> List[Tuple[str, float, int]]:
     """列出数据目录里的回放源：[(路径, 修改时间, 大小)]，新的在前。
 
     三处口径修正：
       1. 大小按「主库 + -wal + -shm」合计。WAL 模式下已提交的数据可能还在
          -wal 里没 checkpoint 回主库，只看主库会把正在采集的会话显示成 0 MB。
       2. 跳过只有文件头、零张表的空库（程序启动时建出来但没采到数据的那些）。
-      3. 递归子目录，`data/<组别>/<人物名>_<时间>/` 这种分层会话也能列出来。
+      3. 递归子目录，`data/<人员姓名>/<任务名>_<时间>/` 这种分层会话也能列出来。
+      4. `folder` 给定时只列那个一级文件夹里的（回放页"先选人再选任务"就是靠它）。
     """
+    target = os.path.join(data_dir, folder) if folder else data_dir
     items = []
-    walker = os.walk(data_dir) if recursive else [(data_dir, [], _listdir(data_dir))]
+    walker = os.walk(target) if recursive else [(target, [], _listdir(target))]
     for root, _dirs, files in walker:
         for name in files:
             lower = name.lower()

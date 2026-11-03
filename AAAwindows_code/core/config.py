@@ -98,6 +98,7 @@ class Config:
     vision_dip_grace: float = 0.3        # 概率瞬时跌落的容忍窗口（秒），防抖动打断判定
     vision_backend: str = 'auto'         # auto / torch / onnx
     vision_face_conf: float = 0.35       # 人脸检测置信度阈值
+    vision_center_band: float = 0.25     # 只认画面中间的人：脸中心允许偏离中线多少（占比）
 
     # ------------------------------------------------------------------
     @classmethod
@@ -147,6 +148,7 @@ class Config:
             vision_dip_grace=cp.getfloat('vision', 'dip_grace', fallback=0.3),
             vision_backend=get('vision', 'backend') or 'auto',
             vision_face_conf=cp.getfloat('vision', 'face_conf', fallback=0.35),
+            vision_center_band=cp.getfloat('vision', 'center_band', fallback=0.25),
         )
 
     # ------------------------------------------------------------------
