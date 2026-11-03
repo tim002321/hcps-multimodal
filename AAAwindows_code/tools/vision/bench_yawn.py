@@ -136,7 +136,7 @@ def bench_real(frames: List[bytes], backend: str, threshold: float, conf: float)
     import cv2
     import numpy as np
 
-    from vision.face_detector import FaceDetector
+    from vision.face_detector import FaceDetector, pick_center_face
     from vision.mouth_state import MouthClassifier
     from vision.yawn_logic import YawnLogic
 
@@ -184,9 +184,9 @@ def bench_real(frames: List[bytes], backend: str, threshold: float, conf: float)
         faces = detector.detect(frame)
         t1 = time.perf_counter()
         prob = 0.0
-        if faces:
+        main = pick_center_face(faces, frame.shape[1])
+        if main is not None:
             detected += 1
-            main = faces[0]
             roi = frame[main.y1:main.y2, main.x1:main.x2]
             if roi.size:
                 prob = classifier.predict(roi)

@@ -58,6 +58,35 @@ class FaceBox:
         return self.x1, self.y1, self.x2, self.y2
 
 
+def pick_center_face(faces: List[FaceBox], width: int,
+                     center_band: float = 0.25) -> Optional[FaceBox]:
+    """从多张脸里挑出画面中间那一个（被试），其余一律忽略。
+
+    `detect()` 返回的是按面积降序的列表，直接取第一个等于"谁离镜头近就认谁"——
+    旁边坐着同事、有人从镜头后走过时，哈欠会记到别人头上。这里改成按位置挑：
+
+    1. 脸中心落在「中线 ± center_band×画面宽」这条带子里的才算候选；
+    2. 候选里取离中线最近的那个（被试就坐在正前方）；
+    3. 带子里一个都没有时：画面只有一张脸仍然用它（单人场景，人可能坐得偏），
+       有多张脸就返回 None —— 宁可这一帧不判定，也不拿旁边的人凑数。
+    """
+    if not faces:
+        return None
+    if width <= 0:
+        return faces[0]
+    middle = width / 2.0
+    limit = width * max(0.02, float(center_band))
+    inside = []
+    for box in faces:
+        offset = abs(float(box.center_x) - middle)
+        if offset <= limit:
+            inside.append((offset, box))
+    if inside:
+        inside.sort(key=lambda item: item[0])
+        return inside[0][1]
+    return faces[0] if len(faces) == 1 else None
+
+
 class FaceDetector:
     """YOLOv8n-face 的薄封装，只暴露「给一帧，返回人脸框列表」。"""
 
@@ -126,7 +155,11 @@ class FaceDetector:
 
     # ------------------------------------------------------------------
     def detect(self, frame_bgr: np.ndarray) -> List[FaceBox]:
-        """返回按面积从大到小排序的人脸框（多张脸时调用方取第一个即可）。"""
+        """返回按面积从大到小排序的人脸框。
+
+        注意别直接取 [0] —— 那等于"认离镜头最近的人"，现场有旁人时会认错。
+        要选被试请用 `pick_center_face()`，它按位置挑画面中间那个。
+        """
         if not self.backend:
             self.load()
         if frame_bgr is None or frame_bgr.size == 0:

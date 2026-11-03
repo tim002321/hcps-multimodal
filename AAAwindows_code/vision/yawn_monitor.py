@@ -114,6 +114,7 @@ class YawnMonitor(threading.Thread):
                  dip_grace_sec: float = 0.3,
                  face_backend: str = 'auto',
                  face_conf: float = 0.35,
+                 center_band: float = 0.25,
                  logic: Optional[YawnLogic] = None,
                  detector: Any = None,
                  classifier: Any = None,
@@ -125,6 +126,9 @@ class YawnMonitor(threading.Thread):
         self.interval = max(0.05, float(interval))
         self.face_backend = face_backend
         self.face_conf = float(face_conf)
+        # 只认画面中间的人：允许脸中心偏离画面中线多少（按画面宽度的比例）。
+        # 0.25 = 中间 50% 宽度这个带子里。旁边的人、背景里的人一律不算。
+        self.center_band = float(center_band)
         self.logic = logic or YawnLogic(threshold=threshold, yawn_min_sec=yawn_min_sec,
                                         cooldown_sec=cooldown_sec,
                                         dip_grace_sec=dip_grace_sec)
@@ -227,17 +231,17 @@ class YawnMonitor(threading.Thread):
 
         prob = 0.0
         boxes: List[tuple] = []
-        if faces:
-            main = faces[0]                               # 取面积最大的一张脸
+        main = self._pick_main_face(faces, frame.shape)
+        if main is not None:
             roi = frame[main.y1:main.y2, main.x1:main.x2]
             if roi.size:
                 prob = self._classifier.predict(roi)
-            # 第一张脸带上概率，界面可以把"张嘴"的框标红
-            boxes = [(faces[0].x1, faces[0].y1, faces[0].x2, faces[0].y2, prob)]
-            boxes += [(box.x1, box.y1, box.x2, box.y2, 0.0) for box in faces[1:]]
+            # 只输出这一张脸：画面里其它人（同事经过、背景有人）既不评分也不画框，
+            # 否则他们的哈欠会被记到当前被试头上。
+            boxes = [(main.x1, main.y1, main.x2, main.y2, prob)]
 
         now = time.monotonic()
-        status: YawnStatus = self.logic.update(now, prob, has_face=bool(faces))
+        status: YawnStatus = self.logic.update(now, prob, has_face=main is not None)
 
         # 计数比上一帧多了 = 刚刚判定出一次哈欠，抛给回调落库。
         # 这里用「计数变化」而不是直接读逻辑里的私有事件列表，是为了让
@@ -271,6 +275,12 @@ class YawnMonitor(threading.Thread):
             fps=round(fps, 1),
             latency_ms=round(total_ms, 1),
         )
+
+    def _pick_main_face(self, faces: List[Any], shape) -> Any:
+        """只挑画面中间那一个人（规则见 vision/face_detector.pick_center_face）。"""
+        from vision.face_detector import pick_center_face
+        width = shape[1] if len(shape) > 1 else 0
+        return pick_center_face(faces, width, self.center_band)
 
     def _publish_empty(self, error: str = '') -> None:
         """没有可用帧时的状态：区分"还没出帧"（正常）与"解码失败"（异常）。"""

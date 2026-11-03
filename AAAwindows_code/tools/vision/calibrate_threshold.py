@@ -66,7 +66,8 @@ def classify_groups(groups: Dict[str, List[str]]) -> Tuple[List[str], List[str]]
     return positives, negatives
 
 
-def score_files(paths: List[str], detector, classifier) -> List[float]:
+def score_files(paths: List[str], detector, classifier,
+                center_band: float = 0.25) -> List[float]:
     """逐图算张嘴概率；没检出人脸的记 -1，统计时单独计数。"""
     import cv2
 
@@ -81,7 +82,11 @@ def score_files(paths: List[str], detector, classifier) -> List[float]:
             missed += 1
             scores.append(-1.0)
             continue
-        box = faces[0]
+        box = pick_center_face(faces, image.shape[1], center_band)
+        if box is None:          # 画面中间没人（旁边的人不算）
+            missed += 1
+            scores.append(-1.0)
+            continue
         roi = image[box.y1:box.y2, box.x1:box.x2]
         if not roi.size:
             missed += 1
@@ -135,6 +140,8 @@ def main() -> int:
     parser.add_argument('--data', required=True, help='素材根目录（含 yawning/ 与 closed/ 等子目录）')
     parser.add_argument('--backend', default='auto', choices=('auto', 'torch', 'onnx'))
     parser.add_argument('--conf', type=float, default=0.35, help='人脸检测置信度阈值')
+    parser.add_argument('--center-band', type=float, default=0.25,
+                        help='只取画面中间的人：脸中心允许偏离中线的比例（0.25=中间一半宽度）')
     args = parser.parse_args()
 
     if not os.path.isdir(args.data):
@@ -155,7 +162,7 @@ def main() -> int:
         print('[失败] 正负两类都要有素材才能标定')
         return 1
 
-    from vision.face_detector import FaceDetector
+    from vision.face_detector import FaceDetector, pick_center_face
     from vision.mouth_state import MouthClassifier
 
     print('\n=== 加载模型 ===')
@@ -171,9 +178,9 @@ def main() -> int:
 
     print('\n=== 打分 ===')
     print('  正类…')
-    pos_scores = score_files(positives, detector, classifier)
+    pos_scores = score_files(positives, detector, classifier, args.center_band)
     print('  负类…')
-    neg_scores = score_files(negatives, detector, classifier)
+    neg_scores = score_files(negatives, detector, classifier, args.center_band)
 
     sweep(pos_scores, neg_scores)
     return 0

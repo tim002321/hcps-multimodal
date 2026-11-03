@@ -101,8 +101,25 @@ def pick_database(explicit: str = '', seconds: float = 15.0) -> str:
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             if 'bracelet_ppg_data' not in tables or 'ecg_data' not in tables:
                 continue
-            start = conn.execute('SELECT MIN(time) FROM ecg_data').fetchone()[0]
-            if not start:
+            # 回放窗口从「所有表里最早的时间」开始（load_packets 就是这么切片的），
+            # 所以锚点必须用会话起点，不能用心电自己的起点 —— 摄像头可能早几十秒。
+            starts = []
+            for table in ('ecg_data', 'bracelet_ppg_data', 'bracelet_gsr_data',
+                          'camera_frames'):
+                if table not in tables:
+                    continue
+                value = conn.execute('SELECT MIN(time) FROM "%s"' % table).fetchone()[0]
+                if value:
+                    starts.append(value)
+            if not starts:
+                continue
+            start = min(starts)
+            # 心电也必须在这段窗口里真的有数据：有些会话 ecg_data 表建了，
+            # 但开头十几秒是空的（电极没贴好），回放窗口里取不到点，断言会误报。
+            ecg = conn.execute(
+                'SELECT COUNT(*) FROM ecg_data WHERE time <= datetime(?, ?)',
+                (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
+            if not ecg:
                 continue
             ppg = conn.execute(
                 'SELECT COUNT(*) FROM bracelet_ppg_data WHERE time <= datetime(?, ?)',
@@ -112,7 +129,7 @@ def pick_database(explicit: str = '', seconds: float = 15.0) -> str:
                 gsr = conn.execute(
                     'SELECT COUNT(*) FROM bracelet_gsr_data WHERE time <= datetime(?, ?)',
                     (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
-            scored.append((ppg + gsr, path))
+            scored.append((ppg + gsr + ecg, path))
         except sqlite3.Error:
             continue
         finally:
@@ -177,8 +194,26 @@ def main() -> int:
     # 三段式流程：先按阶段截，采集段再按标签页逐个截。
     # force=True 是必需的：正常情况下没完成采集进不了②③，但截图要把所有界面都拍到。
     for stage in range(len(STAGE_SPECS)):
-        window.goto_stage(stage, force=True)
-        pump(app, 0.4)
+        if stage == 2 and not window.review_selection:
+            # 正常流程里这一屏是"选完段"之后才来的；截图要模拟一次选区，
+            # 否则拍到的是一个没有图的白板
+            window.mark_stage_done(1)
+            probe = load_packets(db_path, limit_seconds=args.seconds)
+            if probe:
+                window.review_selection = {
+                    'path': db_path, 'start': probe[0][0], 'end': probe[-1][0],
+                    'include': None}
+        if stage == 3 and window.review_selection:
+            # 第 4 段正常是「回放观看 → 下一步」进来的，那时选区已经交给分析页。
+            # 直接 goto_stage(force=True) 会把分析页停在未载入状态，拍出来是空表；
+            # 走 goto_analysis() 才会 adopt_selection() 并真的算一遍。
+            window.goto_analysis()
+            pump(app, 1.2)
+        else:
+            window.goto_stage(stage, force=True)
+            # 回放观看页多等一会儿：脉率要攒够几秒脉搏波才算得出来，
+            # 等太短的话截图里 PPG 那张还是 --，看不出效果
+            pump(app, 3.0 if stage == 2 else 0.4)
         if stage == 0:
             for index in range(window.acq_tabs.count()):
                 window.acq_tabs.setCurrentIndex(index)
@@ -225,6 +260,15 @@ def main() -> int:
                            str(None if image is None else image.shape)))
     checks.append(('摄像头 30fps 入库', camera_rows >= 45,
                    f'2.5 秒写入 {camera_rows} 帧'))
+
+    # 第 4 段：分析页必须真的有结果，且皮电这一路要给出明确结论
+    # （ok 或 n/a 都算"有结论"，状态为空说明根本没跑到分析）
+    analysis = getattr(window, 'analysis_page', None)
+    result_rows = analysis.result_table.rowCount() if analysis is not None else 0
+    eda_block = ((analysis.last_result or {}).get('皮电GSR') or {}) if analysis else {}
+    checks.append(('分析页有结果行', result_rows >= 4, f'{result_rows} 行'))
+    checks.append(('皮电块有结论', eda_block.get('状态') in ('ok', 'n/a'),
+                   f'状态={eda_block.get("状态")}'))
     if camera_stats:
         print(f'  摄像头实测：{camera_stats.get("actual_fps")} fps，'
               f'入库 {camera_stats.get("written")}')

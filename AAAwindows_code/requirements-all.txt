@@ -1,0 +1,47 @@
+# =============================================================================
+# 疲劳监测系统（AAAwindows_code）pip 依赖全量清单
+# -----------------------------------------------------------------------------
+# 与 requirements.txt 的分工：
+#   requirements.txt  —— 只列「必需项」，新机器直接 pip install -r 即可跑起来
+#   本文件            —— 全量清单：必需 + 可选 + import 名对照（可选默认注释掉）
+#
+# 依据：全工程 .py 静态导入扫描（ast，排除标准库与本地模块）
+#       + core/preflight.py 启动自检清单 + 本机 .venv 实测版本
+# 生成：2026-11-03
+#
+# 安装（必须用项目自带解释器，不要用系统 python）：
+#   .venv\Scripts\python.exe -m pip install -r requirements-all.txt
+#
+# 三个「import 名 ≠ pip 包名」已就地标注：
+#   cv2      → opencv-python
+#   serial   → pyserial
+#   PyQt5    → PyQt5（PyQt5-Qt5 / PyQt5_sip 由它自动带上，不必单装）
+# =============================================================================
+
+# ---------- 1. 必需：采集 + 界面。缺任何一个程序直接起不来 ----------
+# 启动自检 core/preflight.py 会检查 numpy、bleak（以及界面模式下的 PyQt5、pyqtgraph）
+bleak>=0.21.0
+PyQt5==5.15.11
+pyqtgraph>=0.13
+numpy>=1.24,<2            # 必须留在 1.x：2.x 与旧版 pyqtgraph / 部分二进制轮子不兼容
+opencv-python>=4.8        # import 名是 cv2
+
+# ---------- 2. 可选：摄像头人脸检测走 GPU（ultralytics + torch） ----------
+# 不装也能跑：无人脸检测时只是没有人脸框和哈欠判定，采集/入库/回放全部正常。
+# CUDA 版 torch 不在 PyPI 主源，必须带 --index-url（合计约 2.3 GB）：
+#   pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
+# 下面三行若单独放开，PyPI 上取到的是 CPU 版 torch：
+# torch==2.5.1
+# torchvision==0.20.1
+# ultralytics==8.4.193
+
+# ---------- 3. 可选：纯 CPU 降级推理 ----------
+# 默认张嘴判定走 opencv 自带的 cv2.dnn（不需要推理引擎）。
+# 只有 config.ini 的 [vision] backend 显式设成 onnx、或 cv2.dnn 加载失败时才回退到它。
+# onnxruntime>=1.16
+
+# ---------- 4. 可选：外设 ----------
+# 肌电（EMG）走 LSL 推流，未装时「肌电」页只提示缺包，不影响其他页面
+# pylsl>=1.16
+# 旧版串口透传手环：python devices/legacy_bracelet.py --serial COM3
+# pyserial>=3.5

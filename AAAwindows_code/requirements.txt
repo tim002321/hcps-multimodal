@@ -2,7 +2,7 @@
 bleak>=0.21.0
 PyQt5==5.15.11
 pyqtgraph>=0.13
-numpy>=1.24
+numpy>=1.24,<2
 # 摄像头采集与打哈欠检测的图像处理都用它（代码里是懒加载，但实际必需）
 opencv-python>=4.8
 
@@ -31,3 +31,18 @@ opencv-python>=4.8
 # 注意：torch / ultralytics 会被 run_monitor.py 在导入 cv2、PyQt5 之前先加载。
 # 顺序反了会在 Windows 上段错误退出，详见 README「三个已经踩过的坑」。
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 外设（可选）：不装只在对应页面提示缺包，不影响采集、入库与回放
+#
+#   肌电（EMG）：devices/emg_receiver.py 走 LSL 推流
+#     pip install pylsl
+#   旧版串口透传手环：python devices/legacy_bracelet.py --serial COM3
+#     pip install pyserial
+#
+# 纯 CPU 降级推理：只有 [vision] backend 设成 onnx、或 cv2.dnn 加载失败时才回退到
+#   onnxruntime，默认路径不需要。
+#     pip install onnxruntime
+# ---------------------------------------------------------------------------
+
+# 完整清单（含全部可选依赖、import 名与 pip 包名对照）见 requirements-all.txt
