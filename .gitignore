@@ -36,3 +36,48 @@ AAAwindows_code/models/*.part
 # 工作记忆与自检截图（本地产物，不进版本库）
 .workbuddy/
 AAAwindows_code/ui_shots/
+
+# ============================================================
+# 2026-11-21 追加：多子项目的产物、临时文件与大体量数据
+# ============================================================
+
+# ---- 打包 / 构建产物 ----
+eye_build/
+face_tool/build/
+face_tool/dist*/
+face_tool/_old/
+**/_old/
+**/_prev_*/
+
+# ---- 模型权重与第三方模型文件（自备，见 README）----
+AAAwindows_code/models/*.pt
+AAAwindows_code/models/*.onnx
+AAAwindows_code/models/*.dat
+AAAwindows_code/models/*.part
+
+# ---- 临时文件、演示脚本与截图 ----
+_tmp_*/
+_tmp_*
+_shot_*.png
+_shot_*.py
+_demo_*.png
+_demo_*.py
+_run_*.py
+_export_*.py
+*.genie
+
+# ---- 离线分析输出 ----
+eye_roi_demo/
+face_roi_demo/
+face_68_demo/
+
+# ---- 采集原始数据（体积大、含被试信息）----
+AAAwindows_code/眼动数据_*.csv
+AAAwindows_code/眼动数据_*.txt
+mental_math_results/
+
+# ---- 本机设置（含现场设备 IP，不应进库）----
+AAAwindows_code/tools/eye/.eye_live_gui.json
+
+# ---- 回滚备份目录 ----
+_backup_*/
