@@ -81,3 +81,6 @@ AAAwindows_code/tools/eye/.eye_live_gui.json
 
 # ---- 回滚备份目录 ----
 _backup_*/
+
+# ---- 仓库快照（本地备份产物）----
+_bundle/
