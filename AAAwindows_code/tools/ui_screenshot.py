@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import os
 import sqlite3
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -25,6 +27,7 @@ if str(ROOT) not in sys.path:
 
 import numpy as np                                                    # noqa: E402
 
+from core.media_paths import media_root                               # noqa: E402
 from ui.buffers import (ECG_RATE, LiveBuffers, ecg_signal_quality,     # noqa: E402
                         estimate_heart_rate)
 from ui.replay import list_sessions, load_packets                     # noqa: E402
@@ -78,17 +81,32 @@ def pump(app, seconds: float) -> None:
         time.sleep(0.02)
 
 
-def pick_database(explicit: str = '', seconds: float = 15.0) -> str:
-    """挑一个前 `seconds` 秒里**心电和手环都有数据**的库。
+def pick_database(explicit: str = '', seconds: float = 30.0):
+    """挑一个**心电和手环都有数据**的库，返回 `(路径, 窗口起点 epoch 或 None)`。
 
-    只看"有没有表"是不够的：有的会话手环比心电晚一分钟才连上，
-    回放前 40 秒里 PPG / GSR 全是空的，冒烟断言会误报失败。
+    锚点不能取「所有表里最早的时间」：摄像头常常比心电早十几分钟开录，按最早时间
+    切窗口，窗口里全是摄像头帧，心电/手环一个点都没有，冒烟断言就会误报失败。
+    所以锚点取「心电和手环都已经有数据」的那一刻，由调用方用 time_range 精确截段。
+
+    解析不出时间时退回 (路径, None)，调用方按 limit_seconds 从最早期载入。
     """
     if explicit:
-        return explicit
+        return explicit, None
     candidates = [path for path, _mtime, _size in list_sessions(str(ROOT / 'data'))
-                  if path.endswith('.db')]
+                  if path.endswith('.db')
+                  # 跳过自检自己产出的库：它是纯摄像头会话，心电/手环全空，
+                  # 一旦被选成回放源，下一轮自检就会误报"心电 0 点"。
+                  and not os.path.basename(path).startswith('uishot_session_')]
     import sqlite3
+
+    def epoch(text):
+        try:
+            return datetime.strptime(text, '%Y-%m-%d %H:%M:%S.%f').timestamp()
+        except (TypeError, ValueError):
+            try:
+                return datetime.strptime(text, '%Y-%m-%d %H:%M:%S').timestamp()
+            except (TypeError, ValueError):
+                return None
 
     scored = []
     for path in candidates:
@@ -101,43 +119,35 @@ def pick_database(explicit: str = '', seconds: float = 15.0) -> str:
                 "SELECT name FROM sqlite_master WHERE type='table'")}
             if 'bracelet_ppg_data' not in tables or 'ecg_data' not in tables:
                 continue
-            # 回放窗口从「所有表里最早的时间」开始（load_packets 就是这么切片的），
-            # 所以锚点必须用会话起点，不能用心电自己的起点 —— 摄像头可能早几十秒。
-            starts = []
-            for table in ('ecg_data', 'bracelet_ppg_data', 'bracelet_gsr_data',
-                          'camera_frames'):
-                if table not in tables:
-                    continue
-                value = conn.execute('SELECT MIN(time) FROM "%s"' % table).fetchone()[0]
-                if value:
-                    starts.append(value)
-            if not starts:
+            mins = {}
+            for table in ('ecg_data', 'bracelet_ppg_data', 'bracelet_gsr_data'):
+                if table in tables:
+                    mins[table] = conn.execute(
+                        'SELECT MIN(time) FROM "%s"' % table).fetchone()[0]
+            if not mins.get('ecg_data') or not mins.get('bracelet_ppg_data'):
                 continue
-            start = min(starts)
-            # 心电也必须在这段窗口里真的有数据：有些会话 ecg_data 表建了，
-            # 但开头十几秒是空的（电极没贴好），回放窗口里取不到点，断言会误报。
-            ecg = conn.execute(
-                'SELECT COUNT(*) FROM ecg_data WHERE time <= datetime(?, ?)',
-                (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
-            if not ecg:
+            # 锚点 = 两路都有数据的那一刻（后到的那一路的开头）
+            start = max(mins['ecg_data'], mins['bracelet_ppg_data'])
+            window = '+{} seconds'.format(int(seconds))
+            counts = {}
+            for table in mins:
+                counts[table] = conn.execute(
+                    'SELECT COUNT(*) FROM "%s" WHERE time <= datetime(?, ?)' % table,
+                    (start, window)).fetchone()[0]
+            if not counts.get('ecg_data') or not counts.get('bracelet_ppg_data'):
                 continue
-            ppg = conn.execute(
-                'SELECT COUNT(*) FROM bracelet_ppg_data WHERE time <= datetime(?, ?)',
-                (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
-            gsr = 0
-            if 'bracelet_gsr_data' in tables:
-                gsr = conn.execute(
-                    'SELECT COUNT(*) FROM bracelet_gsr_data WHERE time <= datetime(?, ?)',
-                    (start, '+{} seconds'.format(int(seconds)))).fetchone()[0]
-            scored.append((ppg + gsr + ecg, path))
+            epoch_start = epoch(start)
+            score = sum(counts.values())
+            scored.append((score, path, epoch_start))
         except sqlite3.Error:
             continue
         finally:
             conn.close()
     if scored:
         scored.sort(reverse=True)
-        return scored[0][1]
-    return candidates[0] if candidates else ''
+        _score, path, start = scored[0]
+        return path, start
+    return (candidates[0] if candidates else ''), None
 
 
 def main() -> int:
@@ -150,12 +160,33 @@ def main() -> int:
     args = parser.parse_args()
 
     # 冒烟只 pump 4 秒 × 3 倍速 ≈ 12 秒的真实数据，按这个窗口挑库
-    db_path = pick_database(args.db)
+    # 先清掉上一次自检可能遗留的库与媒体目录（进程被超时强杀时走不到收尾），
+    # 否则它们会一直被 pick_database 当成候选，或把 data/ 越跑越脏。
+    for stale in glob.glob(os.path.join(str(ROOT / 'data'), 'uishot_session_*')):
+        try:
+            if os.path.isdir(stale):
+                import shutil
+                shutil.rmtree(stale, ignore_errors=True)
+            else:
+                os.remove(stale)
+        except OSError:
+            pass
+
+    db_path, window_start = pick_database(args.db, args.seconds)
     if not db_path or not os.path.exists(db_path):
         print('[失败] 找不到可回放的库，请用 --db 指定')
         return 1
     print(f'回放数据：{db_path}')
-    packets = load_packets(db_path, limit_seconds=args.seconds)
+    window_range = None
+    if window_start is not None:
+        # 从「心电与手环都有数据」的那一刻开始截段，避免窗口被前面十几分钟的
+        # 纯摄像头帧占满（那样缓冲里永远没有心电/手环点）。
+        window_range = (window_start, window_start + args.seconds)
+        packets = load_packets(db_path, time_range=window_range)
+        print('回放窗口：{} 起 {:.0f} 秒'.format(
+            datetime.fromtimestamp(window_start).strftime('%H:%M:%S'), args.seconds))
+    else:
+        packets = load_packets(db_path, limit_seconds=args.seconds)
     print(f'重建 {len(packets)} 个数据包')
 
     buffers = LiveBuffers()
@@ -176,9 +207,11 @@ def main() -> int:
     window.status.set('bracelet', 'connected', 'MPPB20000008',
                       'MPPB20000008  MTU=247')
     window.camera_factory = lambda i, b: FakeCamera(i, b)
-    window.start_camera({'index': 0, 'width': 640, 'height': 480, 'fps': 30.0, 'quality': 80})
+    # 走界面同一条启动路径（15fps 固定），而不是在这里写死一个帧率 ——
+    # 否则自检测的是"这个脚本的参数"，不是用户点「开始采集」时的真实行为。
+    window.start_camera(window._camera_start_config())
     # 用真正的回放器驱动界面（状态页能看到进度条 + 回放预览曲线）
-    window.start_replay(db_path, speed=3.0)
+    window.start_replay(db_path, speed=3.0, time_range=window_range)
     pump(app, 4.0)
 
     snapshot = buffers.snapshot()
@@ -198,7 +231,8 @@ def main() -> int:
             # 正常流程里这一屏是"选完段"之后才来的；截图要模拟一次选区，
             # 否则拍到的是一个没有图的白板
             window.mark_stage_done(1)
-            probe = load_packets(db_path, limit_seconds=args.seconds)
+            probe = load_packets(db_path, limit_seconds=args.seconds,
+                                 time_range=window_range)
             if probe:
                 window.review_selection = {
                     'path': db_path, 'start': probe[0][0], 'end': probe[-1][0],
@@ -247,19 +281,25 @@ def main() -> int:
     camera_stats = window.camera_service.stats() if window.camera_service else {}
     camera_rows = 0
     if camera_stats.get('db_path') and os.path.exists(camera_stats['db_path']):
-        conn = sqlite3.connect(f'file:{camera_stats["db_path"]}?mode=ro', uri=True)
-        try:
-            camera_rows = conn.execute('SELECT COUNT(*) FROM camera_frames').fetchone()[0]
-            sample = conn.execute('SELECT jpeg FROM camera_frames LIMIT 1').fetchone()
-        finally:
-            conn.close()
+        # 照片落文件后，库里的 jpeg 列没了；用 load_camera_rows 统一取（新旧库都支持）
+        from ui.replay import load_camera_rows
+        rows = load_camera_rows(camera_stats['db_path'])
+        camera_rows = len(rows)
+        sample = next((r[2] for r in rows if r[2]), None)
         if sample:
             import cv2
-            image = cv2.imdecode(np.frombuffer(sample[0], dtype=np.uint8), cv2.IMREAD_COLOR)
-            checks.append(('入库的 JPEG 能解码', image is not None and image.shape[0] > 0,
+            image = cv2.imdecode(np.frombuffer(sample, dtype=np.uint8), cv2.IMREAD_COLOR)
+            checks.append(('落盘的照片能解码', image is not None and image.shape[0] > 0,
                            str(None if image is None else image.shape)))
-    checks.append(('摄像头 30fps 入库', camera_rows >= 45,
-                   f'2.5 秒写入 {camera_rows} 帧'))
+        checks.append(('照片写进 frames/ 目录',
+                       bool(camera_stats.get('media_bytes', 0) > 0),
+                       f'{camera_stats.get("media_bytes", 0) / 1024:.0f} KB'))
+    # 断言"帧率落在 15fps 附近"，而不是"帧数够多"：后者在 30fps 下也会通过，
+    # 等于没测到帧率改动。相机会话时长从 stats 里取，不写死 2.5 秒。
+    elapsed = float(camera_stats.get('elapsed') or 0)
+    actual_fps = camera_rows / elapsed if elapsed > 0 else 0.0
+    checks.append(('摄像头 15fps 入库', camera_rows >= 30 and 12.0 <= actual_fps <= 18.0,
+                   f'{camera_rows} 帧 / {elapsed:.1f} 秒 = {actual_fps:.1f} fps'))
 
     # 第 4 段：分析页必须真的有结果，且皮电这一路要给出明确结论
     # （ok 或 n/a 都算"有结论"，状态为空说明根本没跑到分析）
@@ -285,6 +325,25 @@ def main() -> int:
     print('\n[通过] 界面渲染与数据链路正常' if not failures
           else f'\n[失败] {failures}')
     window.close()
+    # 自检产出的采集库和照片/视频目录要自己收走，否则下一轮 pick_database
+    # 可能选中它（纯摄像头会话，心电为空），造成误报。
+    # 采集线程刚停时 Windows 还挂着 mp4 / jpg 的句柄，直接删会 PermissionError，
+    # 而 rmtree(ignore_errors=True) 会把它吞掉、留下几百张图 —— 所以等一拍再重试。
+    import shutil
+    frames_dir = media_root(session_db)
+    for attempt in range(5):
+        for suffix in ('', '-wal', '-shm', '-journal'):
+            try:
+                os.remove(session_db + suffix)
+            except OSError:
+                pass
+        if not os.path.isdir(frames_dir):
+            break
+        shutil.rmtree(frames_dir, ignore_errors=True)
+        if os.path.isdir(frames_dir):
+            time.sleep(0.4)
+    if os.path.isdir(frames_dir):
+        print(f'[注意] 临时媒体目录未能删除：{frames_dir}')
     return 0 if not failures else 1
 
 

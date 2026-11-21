@@ -23,7 +23,11 @@ from typing import List, Optional
 
 import numpy as np
 
-MODELS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'models')
+from core.config import BUNDLE_ROOT
+
+# 模型权重是跟着包走的只读资源：源码运行时在项目根，打包后在 _MEIPASS 里。
+# 不能用 __file__ 往上推 —— 冻结后 __file__ 在 _internal/ 下，路径会错。
+MODELS_DIR = os.path.join(BUNDLE_ROOT, 'models')
 TORCH_MODEL = os.path.join(MODELS_DIR, 'yolov8n-face.pt')
 ONNX_MODEL = os.path.join(MODELS_DIR, 'yolov8n-face.onnx')
 

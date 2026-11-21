@@ -50,6 +50,12 @@ def _is_expected_interpreter() -> bool:
 
 def check_dependencies(need_ui: bool = False) -> None:
     """缺依赖时打印中文指引并退出（退出码 2），不抛一堆 traceback。"""
+    # 打包成 exe 后依赖已经随包分发，这里既没有 venv 也没有 pip。
+    # 再跑检查只会在真缺包时给出"去装 requirements"的错误指引，而且 windowed
+    # 模式下这段写 stderr 根本看不见（表现为"双击没反应"）。直接跳过。
+    if getattr(sys, 'frozen', False):
+        return
+
     required = CORE_MODULES + (UI_MODULES if need_ui else ())
     missing = _missing(required)
     if not missing:

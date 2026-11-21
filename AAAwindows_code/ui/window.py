@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from collections import deque
 from datetime import datetime
@@ -17,7 +18,7 @@ import numpy as np
 import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QImage, QPixmap
-from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
+from PyQt5.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFrame,
                              QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
                              QListWidget, QListWidgetItem, QMessageBox, QPushButton,
                              QProgressBar, QScrollArea, QStackedWidget, QTabWidget,
@@ -25,6 +26,7 @@ from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox,
                              QTableWidgetItem, QVBoxLayout, QWidget)
 
 from core.config import DATA_DIR, Config
+from core import media_paths as media
 from core.device_status import STATE_TEXT, DeviceStatus
 from devices.camera_receiver import CameraService
 from ui import theme
@@ -106,10 +108,12 @@ class PrepPage(BasePage):
         banner_row.addWidget(self.overall_pill, 0)
         self.content.addLayout(banner_row)
 
+        self.device_items = list(self.DEVICES)
+
         cards = QHBoxLayout()
         cards.setSpacing(8)
         self.device_widgets: Dict[str, Dict[str, Any]] = {}
-        for key, title, hint in self.DEVICES:
+        for key, title, hint in self.device_items:
             card = Card(title, hint)
             row = QHBoxLayout()
             marker = dot(theme.PALETTE['text_faint'])
@@ -191,10 +195,16 @@ class PrepPage(BasePage):
             detail = item.get('detail') or '—'
             widgets['detail'].setText(detail)
 
-        ecg = states.get('ecg', {}).get('state', 'idle')
-        bracelet = states.get('bracelet', {}).get('state', 'idle')
-        camera = states.get('camera', {}).get('state', 'idle')
-        ready = all(state == 'connected' for state in (ecg, bracelet, camera))
+        def st(key: str) -> str:
+            return states.get(key, {}).get('state', 'idle')
+
+        keys = [item[0] for item in self.device_items]
+        status = {key: st(key) for key in keys}
+        ready = all(value == 'connected' for value in status.values())
+        connected = [title for key, title, _hint in self.device_items
+                     if status.get(key) == 'connected']
+        total = len(keys)
+
         if ready:
             self.overall_pill.setText('设备已就绪')
             self.overall_pill.setStyleSheet(
@@ -207,20 +217,24 @@ class PrepPage(BasePage):
                                       .format(theme.PALETTE['green'], theme.PALETTE['green']))
             self.connect_button.setText('已连接')
         else:
-            connected = [name for name, state in (('心电贴', ecg), ('手环', bracelet),
-                                                  ('摄像头', camera)) if state == 'connected']
-            self.overall_pill.setText('已连接 {}/3'.format(len(connected)))
+            self.overall_pill.setText('已连接 {}/{}'.format(len(connected), total))
             self.overall_pill.setStyleSheet(
                 f'border-radius: 2px; padding: 3px 12px; font-size: {theme.pt(theme.FS_BASE)};'
                 ' background-color: #F7F7F7; border: 1px solid #B0B0B0; color: #555555;')
+            waiting = [title for key, title, _hint in self.device_items
+                       if status.get(key) != 'connected']
             if not connected:
                 self.banner.setText('尚未连接设备，点击「开始连接」扫描蓝牙并打开摄像头')
             else:
-                self.banner.setText('已连接：{}　等待其余设备…'.format('、'.join(connected)))
+                self.banner.setText('已连接：{}　等待：{}'.format(
+                    '、'.join(connected), '、'.join(waiting)))
             self.banner.setStyleSheet('background-color: #F7F7F7; border: 1px solid #B0B0B0;'
                                       ' padding: 8px 12px; color: #555555; font-weight: bold;')
             self.connect_button.setText('重新连接')
 
+        # 连接流程逐条打勾：顺序固定为 扫描 → 心电 → 手环 → 摄像头 → 就绪
+        ecg, bracelet = status.get('ecg', 'idle'), status.get('bracelet', 'idle')
+        camera = status.get('camera', 'idle')
         step_states = [
             'done' if ecg in ('connecting', 'connected') or bracelet in ('connecting', 'connected')
             else ('run' if 'scanning' in (ecg, bracelet) else 'wait'),
@@ -230,6 +244,7 @@ class PrepPage(BasePage):
             'done' if camera == 'connected' else ('run' if camera == 'connecting' else 'wait'),
             'done' if ready else 'wait',
         ]
+
         marks = {'done': ('√', theme.PALETTE['green']), 'run': ('→', theme.PALETTE['amber']),
                  'wait': ('○', '#777777')}
         base = ('① 扫描蓝牙广播', '② 连接心电贴', '③ 连接绿光手环',
@@ -871,7 +886,11 @@ class StatusPage(BasePage):
         self.confirm_selection()
 
     def _delete_session(self) -> None:
-        """删除当前选中的会话库（连同 -wal / -shm）：双确认，删前把文件名和大小写清楚。"""
+        """删除选中的会话：库文件 + 同目录的 frames/ 照片 + video/ 视频。
+
+        照片和视频不落库，只删 .db 会留下一堆孤儿文件（几万个 jpg 很可能上百 MB），
+        所以这里把它们算进确认框，并一起删除。
+        """
         path = self.replay_combo.currentData()
         if not path or not os.path.exists(path):
             self.replay_info.setText('没有可删除的文件')
@@ -879,11 +898,24 @@ class StatusPage(BasePage):
         if self.window_ref.replay is not None:
             self.window_ref.stop_replay()          # 正在回放的库不能删
 
-        size = format_size(os.path.getsize(path))
+        # 库 + WAL + 照片 + 视频的总大小
+        db_bytes = 0
+        for suffix in ('', '-wal', '-shm', '-journal'):
+            target = path + suffix
+            if os.path.exists(target):
+                try:
+                    db_bytes += os.path.getsize(target)
+                except OSError:
+                    pass
+        media_total = media.media_bytes(path)
+        media_dirs = media.session_media_dirs(path)
+
         answer = QMessageBox.question(
             self, '确认删除',
-            '将永久删除这个会话库，无法恢复：\n\n{}\n{}\n\n'
-            '（同目录的 -wal / -shm 一并删除）'.format(os.path.basename(path), size),
+            '将永久删除这个会话，无法恢复：\n\n{}\n'
+            '会话库：{}\n照片/视频：{}\n\n'
+            '（同目录的 -wal / -shm 一并删除；frames/ 与 video/ 整目录删除）'.format(
+                os.path.basename(path), format_size(db_bytes), format_size(media_total)),
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
             self.replay_info.setText('已取消删除')
@@ -898,8 +930,17 @@ class StatusPage(BasePage):
                 except OSError as exc:
                     QMessageBox.warning(self, '删除失败', f'{target}\n{exc}')
                     break
+        for folder in media_dirs:
+            shutil.rmtree(folder, ignore_errors=True)
+        # 会话目录空了就一起删掉（data/<姓名>/<任务名_时间>/）
+        try:
+            if not os.listdir(os.path.dirname(path)):
+                os.rmdir(os.path.dirname(path))
+        except OSError:
+            pass
         self._refresh_sessions()
-        self.replay_info.setText('已删除 {} 个文件：{}'.format(removed, os.path.basename(path)))
+        self.replay_info.setText('已删除 {} 个文件（含照片/视频）：{}'.format(
+            removed, os.path.basename(path)))
 
 
     def on_tick(self, snapshot: Dict[str, Any]) -> None:
@@ -1257,14 +1298,122 @@ class CameraPage(BasePage):
     title = '摄像头'
     subtitle = ''
 
+    # 采集设置存这里（JSON）。不写回 config.ini —— configparser 回写会把文件里的
+    # 中文注释全丢掉，这是项目里已经定过的规矩（见 ui/profile.py 的同类说明）。
+    PREFS_FILE = os.path.join(DATA_DIR, 'camera_prefs.json')
+
+    # 采集分辨率固定 640×480，界面上不再提供选择。
+    # 原因（都是实测出来的）：
+    #   * 改分辨率必须重开视频流，DSHOW 下要 3~4 秒，这段画面是断的；
+    #   * 1080p 驱动对 640×480 的 set 请求会忽略，得靠 resize 兜底，容易误判"设置没生效"；
+    #   * 打哈欠检测（若开启）、单帧体积、回放解码都是按 640×480 标定的，换分辨率没有收益。
+    CAPTURE_SIZE = (640, 480)
+
+    # 采集帧率固定 15fps，界面上不再提供选择。
+    # 为什么是 15 而不是 30：照片按「帧数 × 单帧体积」线性占盘，
+    #   30fps / JPEG80 / 640×480 约 3.7 GB/小时，15fps 约 1.85 GB/小时，同时录像再 +0.2 GB/h。
+    # 为什么不是 10：录像按 15fps 写，采集若只有 10fps，每帧都要被复制 1~2 次，画面会顿；
+    # 同频后 1:1 落帧最干净。人脸检测每 0.15 秒取一帧（见 vision/yawn_monitor.py），
+    # 15fps 完全够用。
+    CAPTURE_FPS = 15.0
+
+    def current_config(self) -> Dict[str, Any]:
+        """把界面上的采集设置读成一份配置。
+
+        单独抽出来是给 window 用的：「连接设备」按钮启动摄像头时要拿到用户在
+        这一页选的值，不能再用写死的兜底值 —— 否则两边不一致，看起来就像设置没生效。
+        """
+        width, height = self.CAPTURE_SIZE
+        return {
+            'index': int(self.device_spin.value()),
+            'width': int(width),
+            'height': int(height),
+            'fps': float(self.CAPTURE_FPS),
+            'quality': int(self.quality_spin.value()),
+            'backend': 'dshow',
+        }
+
+    def _load_prefs(self) -> Dict[str, Any]:
+        try:
+            with open(self.PREFS_FILE, encoding='utf-8') as fp:
+                data = json.load(fp)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _apply_prefs(self) -> None:
+        """启动时把上次的设置回填到控件；没有记录就保持界面默认值。"""
+        prefs = self._load_prefs()
+        if not prefs:
+            return
+        if isinstance(prefs.get('index'), (int, float)):
+            self.device_spin.setValue(float(prefs['index']))
+        # 分辨率与帧率都固定，不再回填（老 prefs 里的 width/height/fps 直接忽略）
+        if isinstance(prefs.get('quality'), (int, float)):
+            self.quality_spin.setValue(float(prefs['quality']))
+
+    def _save_prefs(self, config: Dict[str, Any]) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.PREFS_FILE), exist_ok=True)
+            with open(self.PREFS_FILE, 'w', encoding='utf-8') as fp:
+                # 只存可变项；分辨率/帧率都是固定值，不写进文件免得以后被误读
+                json.dump({key: config[key] for key in ('index', 'quality')},
+                          fp, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            print('[摄像头] 保存采集设置失败：{}'.format(exc), flush=True)
+
+    # ------------------------------------------------------------- 设置即时生效
+    def _on_settings_changed(self, *_args) -> None:
+        """控件值变了：防抖 500ms 再应用。"""
+        self._settings_timer.start(500)
+
+    def _apply_settings_live(self) -> None:
+        """把界面上的设置应用到正在跑的那路采集。
+
+        分两档，因为代价差一个数量级：
+          * **JPEG 质量** —— 只改内存里的参数，下一帧就生效，画面不中断；
+          * **设备号** —— 必须重开视频流（DSHOW 下约 3 秒），期间预览冻结，
+            状态灯显示「正在应用新设置…」。
+        （分辨率固定 640×480、帧率固定 10fps，界面上都已经不能选了。）
+
+        没在采集时只把设置记下来，等点「开始采集」再用。
+        """
+        config = self.current_config()
+        self._save_prefs(config)
+
+        window = self.window_ref
+        service = window.camera_service
+        capture = getattr(service, 'capture', None) if service is not None else None
+        if service is None or not service.running or capture is None:
+            self.db_label.setText('设置已保存，下次开始采集时生效')
+            return
+
+        if capture.quality != config['quality']:
+            capture.set_quality(config['quality'])
+
+        if int(capture.index) == config['index']:
+            return                     # 热改，下一帧就体现，不打断画面
+
+        # 设备号变了：重开视频流。库路径不变，仍写同一个会话库。
+        try:
+            window.stop_camera()
+            db_path = window.start_camera(config)
+        except Exception as exc:                          # noqa: BLE001
+            self.status_pill.setText('重新打开失败')
+            self.db_label.setText(str(exc))
+            return
+        self._set_db_path(db_path)
+        self._starting_at = time.monotonic()
+        self.status_pill.setText('正在应用新设置…')
+
     def build(self) -> None:
         tiles = QHBoxLayout()
         tiles.setSpacing(8)
         self.tile_frames = StatTile('已入库帧', '帧', '0', theme.PALETTE['red'])
-        self.tile_size = StatTile('库大小', 'MB', '0.0', theme.PALETTE['red'])
-        self.tile_fatigue = StatTile('疲劳状态', '', '—', theme.PALETTE['text_dim'])
-        self.tile_yawn = StatTile('哈欠次数', '次', '0', theme.PALETTE['red'])
-        for tile in (self.tile_frames, self.tile_size, self.tile_fatigue, self.tile_yawn):
+        self.tile_size = StatTile('本次体积', 'MB', '0.0', theme.PALETTE['red'])
+        # 只留采集本身的指标。疲劳/哈欠两张卡已去掉：判定当前是关闭的（见
+        # config.ini 的 [vision] face_only），摆一个恒为 N/A 的数字块只会让人追问。
+        for tile in (self.tile_frames, self.tile_size):
             tiles.addWidget(tile, 1)
         self.status_pill = pill('未开始', theme.PALETTE['text_dim'], '#F0F0F0', '#B0B0B0')
         tiles.addWidget(self.status_pill, 0)
@@ -1305,28 +1454,23 @@ class CameraPage(BasePage):
         row.addStretch(1)
         settings.add_layout(row)
 
-        row2 = field_row('分辨率')
-        self.size_combo = QComboBox()
-        for text, (w, h) in (('640×480', (640, 480)), ('1280×720', (1280, 720)),
-                             ('1920×1080', (1920, 1080))):
-            self.size_combo.addItem(text, (w, h))
-        self.size_combo.setCurrentIndex(1)
-        row2.addWidget(self.size_combo, 1)
-        settings.add_layout(row2)
+        # 分辨率不可调：换分辨率要重开视频流（3~4 秒画面中断），
+        # 而且下游（人脸检测、单帧体积、回放）都是按这个尺寸定的。这里只做展示。
+        size_row = field_row('分辨率')
+        size_row.addWidget(label('{}×{}'.format(*self.CAPTURE_SIZE), 'Dim'))
+        size_row.addStretch(1)
+        settings.add_layout(size_row)
 
-        row3 = field_row('目标帧率')
-        self.fps_spin = QDoubleSpinBox()
-        self.fps_spin.setRange(1.0, 60.0)
-        self.fps_spin.setValue(30.0)
-        self.fps_spin.setFixedWidth(80)
-        row3.addWidget(self.fps_spin)
-        row3.addWidget(label('fps', 'Dim'))
-        row3.addStretch(1)
-        settings.add_layout(row3)
+        # 帧率不可调：15fps 是存储体积与录像流畅度的折中（约 1.4 GB/小时）。
+        fps_row = field_row('目标帧率')
+        fps_row.addWidget(label('{:.0f} fps'.format(self.CAPTURE_FPS), 'Dim'))
+        fps_row.addStretch(1)
+        settings.add_layout(fps_row)
 
         row4 = field_row('JPEG 质量')
         self.quality_spin = QDoubleSpinBox()
         self.quality_spin.setRange(30, 100)
+        self.quality_spin.setDecimals(0)      # 质量是整数档，别显示 80.00
         self.quality_spin.setValue(80)
         self.quality_spin.setFixedWidth(80)
         row4.addWidget(self.quality_spin)
@@ -1343,24 +1487,8 @@ class CameraPage(BasePage):
         buttons.addWidget(open_dir)
         settings.add_layout(buttons)
 
-        # 打哈欠检测开关：默认状态由 config.ini 的 [vision] enabled 决定（开箱为开启）。
-        # 模型在「开始采集」之后才加载，避免没开摄像头就先占显存。
-        yawn_row = QHBoxLayout()
-        self.yawn_check = QCheckBox('启用打哈欠检测')
-        self.yawn_check.setToolTip(
-            '只识别画面中间那一个人：脸中心落在中间 50% 宽度内才计入，\n'
-            '旁边的人（同事、路过的人）不会被当成被试。\n'
-            '宽度可在 config.ini 的 [vision] center_band 调整。')
-        self.yawn_check.toggled.connect(self._on_yawn_toggled)
-        yawn_row.addWidget(self.yawn_check)
-        yawn_row.addStretch(1)
-        settings.add_layout(yawn_row)
-        self.yawn_hint = mono('未启用')
-        self.yawn_hint.setWordWrap(True)
-        settings.add(self.yawn_hint)
-        if getattr(Config.load(), 'vision_enabled', False):
-            self.yawn_check.setChecked(True)      # 触发 _on_yawn_toggled，提示「开始采集后生效」
-
+        # 人脸检测不给开关：只要开始采集就自动检测并画框（是否启用由
+        # config.ini 的 [vision] enabled 决定，模型在采集启动后才加载）。
         settings.body.addStretch(1)      # 设置项靠上，库路径留在底部，不被均匀拉开
         self.db_label = mono('未开始')
         self.db_label.setWordWrap(True)
@@ -1371,6 +1499,17 @@ class CameraPage(BasePage):
         self.preview_timer = QTimer(self)
         self.preview_timer.timeout.connect(self._refresh_preview)
         self.preview_timer.start(33)                  # 约 30fps 刷新预览
+        self._apply_prefs()                           # 回填上次的采集设置
+        self._starting_at = 0.0                       # 正在等首帧的起始时刻
+
+        # 设置改完立即生效：四个控件变更后防抖 500ms 再应用，拖动数字框时不会
+        # 连续重启视频流。注意必须排在上面 _apply_prefs() 之后 —— 否则回填设置
+        # 本身就会触发一次"应用"。
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.timeout.connect(self._apply_settings_live)
+        self.device_spin.valueChanged.connect(self._on_settings_changed)
+        self.quality_spin.valueChanged.connect(self._on_settings_changed)
 
     # ------------------------------------------------------------- 控制
     def _toggle(self) -> None:
@@ -1382,45 +1521,23 @@ class CameraPage(BasePage):
             self.start_button.setStyle(self.start_button.style())
             self.status_pill.setText('已停止')
             return
-        width, height = self.size_combo.currentData()
-        config = {
-            'index': int(self.device_spin.value()),
-            'width': width,
-            'height': height,
-            'fps': float(self.fps_spin.value()),
-            'quality': int(self.quality_spin.value()),
-            'backend': 'dshow',
-        }
+        config = self.current_config()
+        self._save_prefs(config)
         try:
             db_path = window.start_camera(config)
         except Exception as exc:                      # noqa: BLE001
             self.status_pill.setText('启动失败')
             self.db_label.setText(str(exc))
             return
-        self.db_label.setText('库：' + db_path)
+        self._set_db_path(db_path)
         self.start_button.setText('停止采集')
         self.start_button.setObjectName('Danger')
         self.start_button.setStyle(self.start_button.style())
-        self.status_pill.setText('采集中')
-        # 勾了「启用打哈欠检测」就在采集启动后加载模型（首次约 2~5 秒）
-        if self.yawn_check.isChecked():
-            self._on_yawn_toggled(True)
-
-    def _on_yawn_toggled(self, checked: bool) -> None:
-        window = self.window_ref
-        window.yawn_wanted = bool(checked)      # 记住用户意图，重启采集时沿用
-        if not checked:
-            window.set_yawn_enabled(False)
-            self.yawn_hint.setText('未启用')
-            return
-        if window.camera_service is None or not window.camera_service.running:
-            self.yawn_hint.setText('开始采集后生效')
-            return
-        self.yawn_hint.setText('模型加载中…')
-        if window.set_yawn_enabled(True):
-            self.yawn_hint.setText('正在初始化')
-        else:
-            self.yawn_hint.setText('启动失败：请先开始采集')
+        # 打开摄像头不是瞬间完成的：DSHOW 下 set(HEIGHT) 要重建视频流（约 1.5 秒），
+        # 加上 VideoCapture 初始化，首帧通常在 1.5~3.5 秒后才到。这段时间界面必须
+        # 明确说"在打开"，否则用户会以为点了没反应、设置没生效。
+        self._starting_at = time.monotonic()
+        self.status_pill.setText('正在打开摄像头…')
 
     def _open_dir(self) -> None:
         try:
@@ -1438,7 +1555,16 @@ class CameraPage(BasePage):
             return
         latest = service.latest_frame()
         if latest is None:
+            # 首帧还没到：正常情况下 1.5~3.5 秒（set(HEIGHT) 要重建视频流），
+            # 超过 15 秒基本就是被别的程序占着摄像头，给个明确的说法。
+            if self._starting_at and time.monotonic() - self._starting_at > 15.0:
+                self.status_pill.setText('打开超时')
+                self.frame_label.setText('15 秒内没画面：确认摄像头没被相机/会议软件占用后重试')
+                self._starting_at = 0.0
             return
+        if self._starting_at:
+            self.status_pill.setText('采集中')
+            self._starting_at = 0.0
         jpeg, index, stamp = latest
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
@@ -1451,10 +1577,36 @@ class CameraPage(BasePage):
         self.preview.setPixmap(QPixmap.fromImage(image).scaled(
             max(64, self.preview.width() - 4), max(64, self.preview.height() - 4),
             Qt.KeepAspectRatio, Qt.SmoothTransformation))
-        self.frame_label.setText('帧 #{:<7d}  {}  {}×{}'.format(index, stamp, width, height))
+        self.frame_label.setText(self._frame_text(service, index, stamp, width, height))
+
+    @staticmethod
+    def _frame_text(service, index: int, stamp: str, width: int, height: int) -> str:
+        """预览下方那行状态：帧号 / 时间 / 编码尺寸，并标出摄像头真实输出尺寸。
+
+        当 cap.set() 被驱动忽略时，画面是低分辨率放大出来的，而编码尺寸仍然是
+        目标值 —— 两个数字都摆出来，才看得出「设置到底生效没有」。
+        """
+        text = '帧 #{:<7d}  {}  {}×{}'.format(index, stamp, width, height)
+        capture = getattr(service, 'capture', None)
+        quality = getattr(capture, 'quality', None)
+        if quality:
+            # 质量可以在运行时热改（不重开流），把当前生效值显示出来，
+            # 否则用户改完质量条看不到任何反馈。
+            text += '  Q{}'.format(int(quality))
+        native = getattr(capture, 'native_resolution', None)
+        if native:
+            nw, nh = int(native[0]), int(native[1])
+            if (nw, nh) != (width, height):
+                action = '放大' if nw * nh < width * height else '缩小'
+                text += ' ｜ 摄像头实采 {}×{}（已{}）'.format(nw, nh, action)
+        return text
 
     def _draw_faces(self, frame) -> None:
-        """把推理线程给的人脸框叠到画面上：张嘴标红、闭合标绿。"""
+        """把推理线程给的人脸框叠到画面上。
+
+        只框脸模式（face_only）统一画绿色框、不标数字 —— 没有张嘴概率可标；
+        完整模式下张嘴标红、闭合标绿。
+        """
         import cv2
 
         state = self.window_ref.yawn_state
@@ -1462,6 +1614,10 @@ class CameraPage(BasePage):
             return
         snapshot = state.snapshot()
         if not snapshot.faces:
+            return
+        if snapshot.face_only:
+            for x1, y1, x2, y2, _prob in snapshot.faces:
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 80), 2)
             return
         threshold = snapshot.threshold or 0.5
         for face in snapshot.faces:
@@ -1472,17 +1628,30 @@ class CameraPage(BasePage):
             cv2.putText(frame, '{:.2f}'.format(prob), (x1 + 4, max(14, y1 - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
+    def _set_db_path(self, path: str) -> None:
+        """库路径只显示末尾两段，完整路径挂到 tooltip。
+
+        右侧设置栏只有 300px 宽，1.25 倍字号下全路径必然被截断成
+        `F:\\hcpsproject\\PyCharmMiscProject\\AAAwindows_` 这种没用的半截。
+        """
+        parts = [part for part in str(path).split(os.sep) if part]
+        tail = os.sep.join(parts[-2:]) if len(parts) >= 2 else str(path)
+        self.db_label.setText('库：…' + os.sep + tail if len(parts) > 2 else '库：' + tail)
+        self.db_label.setToolTip(str(path))
+
     def on_tick(self, snapshot: Dict[str, Any]) -> None:
-        self._refresh_yawn_tiles()
         service = self.window_ref.camera_service
         if service is None:
             return
         stats = service.stats()
-        self.db_label.setText('库：' + stats['db_path'])
+        self._set_db_path(stats['db_path'])
         self.tile_frames.set_value(str(stats['written']))
-        self.tile_size.set_value(f'{stats["db_size"] / 1024 / 1024:.1f}')
+        # 体积 = 会话库 + 照片 + 视频；照片不再进库，只看 db_size 会显示成 0.0
+        self.tile_size.set_value(f'{stats.get("total_bytes", stats["db_size"]) / 1024 / 1024:.1f}')
         if stats.get('error'):
             self.status_pill.setText(stats['error'])
+        elif stats.get('video_error'):
+            self.status_pill.setText('录像失败：' + str(stats['video_error']))
         elif service.running:
             self.status_pill.setText(f'采集中 {stats["frames"]} 帧')
         # 按钮状态跟实际采集状态同步（由「设备准备」启动时也能看到"停止采集"）
@@ -1494,60 +1663,13 @@ class CameraPage(BasePage):
             self.start_button.setObjectName(want_name)
             self.start_button.setStyle(self.start_button.style())
 
-    def _refresh_yawn_tiles(self) -> None:
-        """把推理线程的快照刷到两个指标块与提示行上。"""
-        state = self.window_ref.yawn_state
-        if state is None:
-            return
-        snapshot = state.snapshot()
-
-        colors = {
-            'no_face': theme.PALETTE['text_dim'],
-            'normal': theme.PALETTE['green'],
-            'open': theme.PALETTE['amber'],
-            'yawning': theme.PALETTE['red'],
-        }
-        fatigue_colors = {
-            'normal': theme.PALETTE['green'],
-            'mild': theme.PALETTE['amber'],
-            'severe': theme.PALETTE['red'],
-        }
-
-        if snapshot.error:
-            self.tile_fatigue.set_value('异常', accent=theme.PALETTE['red'])
-            self.yawn_hint.setText(snapshot.error)
-            return
-
-        if snapshot.loading:
-            self.tile_fatigue.set_value('加载中', accent=theme.PALETTE['text_dim'])
-            self.yawn_hint.setText('模型加载中…')
-            return
-
-        if not snapshot.running:
-            self.tile_fatigue.set_value('—', accent=theme.PALETTE['text_dim'])
-            if self.yawn_check.isChecked():
-                self.yawn_hint.setText('未运行（开始采集后生效）')
-            return
-
-        self.tile_fatigue.set_value(
-            '{}/{}'.format(snapshot.state_text, snapshot.fatigue_text),
-            accent=colors.get(snapshot.state, theme.PALETTE['text_dim']))
-        self.tile_yawn.set_value(str(snapshot.yawn_count),
-                                 accent=fatigue_colors.get(snapshot.fatigue,
-                                                           theme.PALETTE['red']))
-        detail = '{} · 张口 {:.2f} · {:.1f}fps · {:.0f}ms'.format(
-            snapshot.backend or '推理中', snapshot.prob, snapshot.fps, snapshot.latency_ms)
-        if snapshot.state == 'no_face':
-            detail += ' · 未检测到人脸'
-        self.yawn_hint.setText(detail)
-
 
 class MonitorWindow(QMainWindow):
     """主窗口。"""
 
     def __init__(self, buffers: LiveBuffers, session_info: Optional[Dict[str, Any]] = None,
                  writer=None, status: Optional[DeviceStatus] = None,
-                 ble_start=None, ble_stop=None, config=None):
+                 ble_start=None, ble_stop=None, eye_service=None, config=None):
         super().__init__()
         self.buffers = buffers
         self.session_info = session_info or {}
@@ -1559,6 +1681,9 @@ class MonitorWindow(QMainWindow):
         self.status = status or DeviceStatus()
         self.ble_start = ble_start
         self.ble_stop = ble_stop
+        # 眼动 UDP 接收线程（devices/eye_receiver.EyeReceiver），没启用时为 None。
+        # 由 run_monitor 创建，这里只持有引用，供「眼动仪」页读统计。
+        self.eye_service = eye_service
         # 打哈欠检测：配置 + 后台线程 + 状态快照（线程写、界面读）
         self.cfg = config
         self.yawn_state: Optional[YawnState] = None
@@ -1946,8 +2071,31 @@ class MonitorWindow(QMainWindow):
 
     # ------------------------------------------------------------- 摄像头
     def default_camera_config(self) -> Dict[str, Any]:
-        return {'index': 0, 'width': 640, 'height': 480, 'fps': 30.0, 'quality': 80,
+        """兜底配置。分辨率与帧率跟随摄像头页的固定值（640×480 / 10fps）。
+
+        改分辨率必须重开视频流（DSHOW 下 3~4 秒画面中断），而且下游都按 640×480
+        标定；帧率定 10fps 是为了压存储（30fps 约 3.7GB/小时，10fps 约 1.2GB/小时）。
+        这里跟随固定值，避免「连接设备」和摄像头页两条路径不一致。
+        """
+        return {'index': 0, 'width': self.CAPTURE_SIZE[0], 'height': self.CAPTURE_SIZE[1],
+                'fps': self.CAPTURE_FPS, 'quality': 80,
                 'backend': 'dshow', 'camera': 'usb0'}
+
+    def _camera_start_config(self) -> Dict[str, Any]:
+        """启动摄像头该用哪份配置。
+
+        优先级：摄像头页当前控件值 > 上次启动用的 > 兜底默认。
+        之前「连接设备」按钮直接取 `self.camera_config or default_camera_config()`，
+        而 camera_config 初始为空，于是永远落到 640×480 —— 跟用户在摄像头页
+        选的 1280×720 对不上，表现就是「采集设置没生效」。
+        """
+        page = self._page_by_class('CameraPage')
+        if page is not None and hasattr(page, 'current_config'):
+            try:
+                return page.current_config()
+            except Exception:                          # noqa: BLE001 - 控件还没建好时不硬失败
+                pass
+        return dict(self.camera_config or self.default_camera_config())
 
     def start_camera(self, config: Optional[Dict[str, Any]] = None) -> str:
         """启动 USB 摄像头采集（帧按目标帧率入库）。"""
@@ -1959,9 +2107,8 @@ class MonitorWindow(QMainWindow):
         self.camera_service = CameraService(self.camera_config, db_path=session_db,
                                             capture_factory=self.camera_factory)
         db_path = self.camera_service.start()
-        # 摄像头一起来就按需拉起打哈欠检测（默认开启）。
-        # 这样不管是从摄像头页点「开始采集」、还是设备准备页/命令行启动，行为一致；
-        # 用户主动取消过勾选（yawn_wanted=False）就不会被重新拉起来。
+        # 摄像头一起来就拉起人脸检测（画框）。界面上已经没有开关了，
+        # 三个入口（摄像头页、设备准备页、命令行）行为一致，都看 config 的 [vision] enabled。
         wanted = self.yawn_wanted
         if wanted is None:
             wanted = bool(getattr(self.cfg, 'vision_enabled', True))
@@ -2022,6 +2169,7 @@ class MonitorWindow(QMainWindow):
             face_backend=getattr(cfg, 'vision_backend', 'auto'),
             face_conf=getattr(cfg, 'vision_face_conf', 0.35),
             center_band=getattr(cfg, 'vision_center_band', 0.25),
+            face_only=getattr(cfg, 'vision_face_only', True),
             on_event=self._write_yawn_event,
         )
         self.yawn_monitor = monitor
@@ -2058,7 +2206,7 @@ class MonitorWindow(QMainWindow):
                 self.status.set('bracelet', 'error', '', str(exc))
         if self.camera_service is None or not self.camera_service.running:
             try:
-                self.start_camera(self.camera_config or self.default_camera_config())
+                self.start_camera(self._camera_start_config())
             except Exception as exc:                  # noqa: BLE001
                 self.status.set('camera', 'error', '', str(exc))
 

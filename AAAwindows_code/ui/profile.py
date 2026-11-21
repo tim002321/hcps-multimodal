@@ -40,6 +40,14 @@ DEVICE_CHOICES = [
     ('eye', '眼动仪', True),
 ]
 
+# 悬停提示：为什么默认没勾、勾了要怎么才有数据。
+# 眼动仪已经能出数据了，但接收端要显式打开（config.ini 的 eye_enabled 或 --eye），
+# 所以在登录界面仍然默认不勾 —— 免得用户以为勾上就该有数字。
+DEVICE_TIPS = {
+    'emg': '预留设备：页面可用，但当前版本不产生数据',
+    'eye': '需先在 config.ini 把 eye_enabled 改成 true（或启动加 --eye）才会开始收数',
+}
+
 # 真正能产出数据的设备；其余都是预留
 DATA_DEVICES = ('ecg', 'bracelet', 'camera')
 
@@ -228,8 +236,8 @@ class ProfileDialog(QDialog):
         for key, name, reserved in DEVICE_CHOICES:
             box = QCheckBox(name)
             box.setChecked(not reserved)
-            if reserved:
-                box.setToolTip('预留设备：页面可用，但当前版本不产生数据')
+            if key in DEVICE_TIPS:
+                box.setToolTip(DEVICE_TIPS[key])
             self.device_boxes[key] = box
             device_row.addWidget(box)
         device_row.addStretch(1)

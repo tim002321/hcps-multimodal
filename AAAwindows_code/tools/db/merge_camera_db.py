@@ -24,6 +24,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from devices.camera_receiver import DDL                     # noqa: E402
+from devices.camera_media import FrameStore                 # noqa: E402
+from core import media_paths as media                       # noqa: E402
 from ui.replay import find_camera_companion, load_camera_rows   # noqa: E402
 
 
@@ -53,15 +55,31 @@ def main() -> int:
     try:
         for ddl in DDL:
             conn.execute(ddl)
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(camera_frames)')}
+        use_files = 'file_name' in columns        # 新库：照片落文件
+        store = FrameStore(media.frames_dir(session_db)) if use_files else None
+        if use_files:
+            print('照片目录：' + media.frames_dir(session_db))
+
         existing = {(r[0], r[1]) for r in conn.execute(
             'SELECT time, frame_index FROM camera_frames')}
         copied = 0
         for stamp, frame_index, jpeg in rows:
             if (stamp, frame_index) in existing:
                 continue
-            conn.execute('INSERT INTO camera_frames (time, camera, frame_index, width, height, jpeg)'
-                         ' VALUES (?,?,?,?,?,?)',
-                         (stamp, 'usb0', frame_index, 640, 480, jpeg))
+            if use_files:
+                name = store.save(jpeg)
+                if not name:
+                    continue                 # 写盘失败就跳过，别留空指向
+                conn.execute(
+                    'INSERT INTO camera_frames (time, camera, frame_index, width, height, file_name)'
+                    ' VALUES (?,?,?,?,?,?)',
+                    (stamp, 'usb0', frame_index, 640, 480, name))
+            else:
+                conn.execute(
+                    'INSERT INTO camera_frames (time, camera, frame_index, width, height, jpeg)'
+                    ' VALUES (?,?,?,?,?,?)',
+                    (stamp, 'usb0', frame_index, 640, 480, jpeg))
             copied += 1
         conn.commit()
         total = conn.execute('SELECT COUNT(*) FROM camera_frames').fetchone()[0]

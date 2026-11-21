@@ -89,21 +89,16 @@ def make_stub_frames(size: int = 24) -> List[bytes]:
 # 从会话库 / 目录取帧
 # ---------------------------------------------------------------------------
 def load_frames_from_db(db_path: str, limit: int) -> List[bytes]:
-    import sqlite3
-
+    """从会话库取帧（新旧两种存法都支持：照片落文件 / 老的 jpeg BLOB）。"""
     if not os.path.exists(db_path):
         raise SystemExit('库文件不存在：{}'.format(db_path))
-    conn = sqlite3.connect('file:{}?mode=ro'.format(db_path), uri=True)
-    try:
-        tables = [row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")]
-        if 'camera_frames' not in tables:
-            raise SystemExit('这个库里没有 camera_frames 表：{}'.format(db_path))
-        rows = conn.execute(
-            'SELECT jpeg FROM camera_frames ORDER BY frame_index LIMIT ?', (limit,)).fetchall()
-    finally:
-        conn.close()
-    return [row[0] for row in rows]
+
+    from ui.replay import load_camera_rows
+
+    rows = load_camera_rows(db_path)
+    if not rows:
+        raise SystemExit('这个库里没有 camera_frames 表或没有帧：{}'.format(db_path))
+    return [jpeg for _ts, _index, jpeg in rows[:limit] if jpeg]
 
 
 def load_frames_from_dir(folder: str, limit: int) -> List[bytes]:

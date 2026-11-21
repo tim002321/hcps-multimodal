@@ -23,6 +23,7 @@ sys.path.insert(0, ROOT)
 
 from core.config import DATA_DIR                       # noqa: E402
 from core.db_storage import DB_SUFFIXES, db_total_size, is_empty_db   # noqa: E402
+from core import media_paths as media                  # noqa: E402
 from ui.replay import format_size                      # noqa: E402
 
 
@@ -54,11 +55,37 @@ def scan_empty_dirs(data_dir: str):
     return sorted(empties)
 
 
+def scan_orphan_media(data_dir: str):
+    """有 frames/ 或 video/、但同级（或 _media 的父级）已经没有会话库的目录。
+
+    照片和视频不落库，手动删了 .db 就会留下成百上千个孤儿 jpg/mp4。
+    这里只做识别：会话目录下找不到 .db / .jsonl 才算孤儿。
+    """
+    orphans = []
+    for root, _dirs, _files in os.walk(data_dir):
+        if os.path.basename(root) not in ('frames', 'video'):
+            continue
+        session_dir = os.path.dirname(root)
+        # data 根下的库会退到 <库名>_media/frames，真正的会话目录要再上一层
+        if os.path.basename(session_dir).endswith('_media'):
+            session_dir = os.path.dirname(session_dir)
+        try:
+            siblings = os.listdir(session_dir)
+        except OSError:
+            continue
+        has_db = any(n.lower().endswith(('.db', '.jsonl')) for n in siblings)
+        if not has_db:
+            orphans.append(session_dir)
+    return sorted(set(orphans), key=len, reverse=True)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description='清理零张表的空库（默认只报告）')
     parser.add_argument('--data-dir', default=DATA_DIR, help='数据目录，默认 core.config.DATA_DIR')
     parser.add_argument('--delete', action='store_true', help='真正删除（否则只报告）')
     parser.add_argument('--yes', action='store_true', help='删除时跳过交互确认')
+    parser.add_argument('--prune-orphans', action='store_true',
+                        help='同时检查「有照片/视频但没有库」的孤儿会话目录')
     args = parser.parse_args(argv)
 
     data_dir = args.data_dir
@@ -74,8 +101,27 @@ def main(argv=None) -> int:
         rel = os.path.relpath(path, data_dir)
         print('  {:>6}  {}'.format(format_size(size), rel))
 
+    if args.prune_orphans:
+        orphans = scan_orphan_media(data_dir)
+        print('\n孤儿媒体目录（有照片/视频但没有会话库）：{} 个'.format(len(orphans)))
+        for folder in orphans:
+            size = sum(media.dir_bytes(os.path.join(folder, name))
+                       for name in ('frames', 'video'))
+            print('  {:>8}  {}'.format(format_size(size), os.path.relpath(folder, data_dir)))
+        if orphans and args.delete:
+            if not args.yes:
+                answer = input('\n将删除上面 {} 个孤儿目录，输入 yes 继续：'.format(len(orphans)))
+                if answer.strip().lower() != 'yes':
+                    print('已取消删除孤儿目录。')
+                    orphans = []
+            for folder in orphans:
+                shutil.rmtree(folder, ignore_errors=True)
+            print('已删除孤儿目录 {} 个。'.format(len(orphans)))
+        elif orphans:
+            print('（加 --delete --yes 才会删除）')
+
     if not empties:
-        print('没有需要清理的空库。')
+        print('\n没有需要清理的空库。')
         return 0
 
     if not args.delete:

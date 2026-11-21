@@ -27,6 +27,47 @@ from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 
+def _setup_frozen_stdio() -> None:
+    """打包成无控制台 exe 后，把 stdout/stderr 接到 <exe目录>/logs/app.log。
+
+    为什么必须做：PyInstaller 的 windowed 模式下 `sys.stdout` 是 `None`，
+    而这个项目里有几十处 `print(..., flush=True)`（启动信息、连接状态、设备掉线），
+    一旦打印就抛 `AttributeError: 'NoneType' object has no attribute 'write'`，
+    表现为"双击闪一下就没了"，还什么都看不到。
+
+    接到日志文件之后：① print 照常工作；② 交付到现场后出问题能让人把
+    `logs/app.log` 发回来，不用重新跑一遍复现。
+
+    必须在 `_preload_vision_runtime()` 之前调用 —— 那段如果抛异常也会有打印。
+    """
+    if not getattr(sys, 'frozen', False):
+        return
+
+    try:
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(sys.executable)), 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'app.log')
+        # 单文件 5MB 上限：日志只用来排障，不留给它无限长
+        try:
+            if os.path.getsize(log_path) > 5 * 1024 * 1024:
+                os.replace(log_path, log_path + '.1')
+        except OSError:
+            pass
+        stream = open(log_path, 'a', buffering=1, encoding='utf-8', errors='replace')
+    except OSError:
+        return          # 连日志都写不了时只能放弃，别让启动挂在第一步
+
+    if sys.stdout is None:
+        sys.stdout = stream
+    if sys.stderr is None:
+        sys.stderr = stream
+    print('===== 启动 {} ====='.format(
+        os.path.basename(sys.executable)), flush=True)
+
+
+_setup_frozen_stdio()
+
+
 def _preload_vision_runtime() -> None:
     """在任何其他第三方包之前，把视觉推理的原生依赖加载好。
 
@@ -63,6 +104,7 @@ from core.device_status import DeviceStatus
 from core.writer_thread import SensorWriter
 from devices.bracelet_receiver import start_bracelet
 from devices.ecg_receiver import PacketOutput, start_receiver
+from devices.eye_receiver import EyeReceiver
 from ui.buffers import LiveBuffers, MonitorRecorder
 from ui import theme
 from ui.profile import ProfileDialog
@@ -150,6 +192,10 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument('--replay', help='启动后直接回放这个 .db / .jsonl')
     parser.add_argument('--speed', type=float, default=1.0, help='回放倍速')
     parser.add_argument('--no-ble', action='store_true', help='不启动蓝牙，只开界面')
+    parser.add_argument('--no-eye', action='store_true',
+                        help='不监听眼动 UDP（即使 config.ini 里 eye_enabled=true）')
+    parser.add_argument('--eye', action='store_true',
+                        help='临时监听眼动 UDP（不用改 config.ini，等价于 eye_enabled=true）')
     parser.add_argument('--auto-connect', action='store_true',
                         help='启动后自动执行「设备准备」流程（连蓝牙 + 开摄像头）')
     parser.add_argument('--out', help='JSONL 输出路径（默认不写；传 none 表示不写）')
@@ -243,6 +289,36 @@ def main(argv: Optional[list] = None) -> int:
             current.stop()
             service_holder['service'] = None
 
+    # 眼动（aSeeStudio UDP）与蓝牙无关：它监听本机端口，按 config 的 eye_enabled 启动
+    eye_holder: Dict[str, Optional[EyeReceiver]] = {'service': None}
+
+    def start_eye() -> None:
+        if args.no_eye:
+            return
+        if not (cfg.eye_enabled or args.eye):
+            return
+        current = eye_holder['service']
+        if current is not None and current.is_alive():
+            return
+        service = EyeReceiver(recorder=recorder, port=cfg.eye_udp_port,
+                              bind_host=cfg.eye_bind, status=status,
+                              debug=cfg.eye_debug, idle_warn_sec=cfg.eye_idle_warn)
+        eye_holder['service'] = service
+        service.start()
+
+    def stop_eye() -> None:
+        current = eye_holder['service']
+        if current is not None:
+            current.stop()
+            eye_holder['service'] = None
+
+    if args.no_eye:
+        print('[眼动] 命令行指定 --no-eye，不启动接收', flush=True)
+    elif not (cfg.eye_enabled or args.eye):
+        print('[眼动] config.ini 的 eye_enabled=false，未启动接收（要临时打开用 --eye）',
+              flush=True)
+    start_eye()
+
     window = MonitorWindow(
         buffers,
         session_info={
@@ -262,6 +338,7 @@ def main(argv: Optional[list] = None) -> int:
         status=status,
         ble_start=None if args.no_ble else start_ble,
         ble_stop=None if args.no_ble else stop_ble,
+        eye_service=eye_holder['service'],
         config=cfg,
     )
     window.show()
@@ -282,6 +359,7 @@ def main(argv: Optional[list] = None) -> int:
         return app.exec_()
     finally:
         stop_ble()
+        stop_eye()
         writer.stop()
         storage.close()
 

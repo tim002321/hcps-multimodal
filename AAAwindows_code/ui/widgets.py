@@ -112,13 +112,21 @@ class StatTile(QFrame):
         self.value.setStyleSheet(f'font-family: "Consolas"; font-size: {theme.pt(theme.FS_METRIC)};'
                                  f' font-weight: bold; color: {accent};')
         row.addWidget(self.value)
-        if unit:
-            row.addWidget(label(unit, 'StatUnit'))
+        # 单位单独留一个引用：值可能是 N/A（比如人脸只框选时不做哈欠判定），
+        # 那时候"N/A 次"读起来别扭，需要能把单位一起隐藏。
+        self.unit_label = label(unit, 'StatUnit')
+        self.unit_label.setVisible(bool(unit))
+        row.addWidget(self.unit_label)
         row.addStretch(1)
         layout.addLayout(row)
         self.note = label(note, 'StatLabelFaint')
         self.note.setVisible(bool(note))
         layout.addWidget(self.note)
+
+    def set_unit(self, unit: str) -> None:
+        """换单位；传空串即隐藏（值本身不是数量时用）。"""
+        self.unit_label.setText(unit)
+        self.unit_label.setVisible(bool(unit))
 
     def set_value(self, value: str, note: Optional[str] = None, accent: Optional[str] = None) -> None:
         self.value.setText(value)

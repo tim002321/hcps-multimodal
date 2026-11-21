@@ -32,6 +32,10 @@ BRACELET_GSR_TABLE = "bracelet_gsr_data"          # 皮电，每个样本一行�
 BRACELET_SKIN_TEMP_TABLE = "bracelet_skin_temp"   # 肤温，每次上报一行（标量，℃）
 BRACELET_BATTERY_TABLE = "bracelet_battery"       # 电量，每次上报一行 {"adc":..,"percent":..}
 
+# 眼动（aSeeStudio 字符串报文）：一帧一行，value 存整帧字段的 JSON。
+# 字段含义见 devices/eye_protocol.py 的 FIELDS / FIELD_LABELS。
+EYE_TABLE = "eye_data"
+
 
 # 呼吸通道是否入库。先关掉：现场多数会话这一路全是 0（没接呼吸带），
 # 存进去只会在回放里多一条直线，还占空间。实时曲线的数据不受影响
@@ -220,8 +224,8 @@ class SensorDB:
 class DataRecorder:
     """统一的传感器数据入库接口（供各接收模块调用）。
 
-    当前已接入：心电(ecg_data)、体温(temperature_data)、三轴(triaxial_data)；
-    呼吸(breath_data) 暂时不入库，见模块级 SAVE_RESP。
+    当前已接入：心电(ecg_data)、体温(temperature_data)、三轴(triaxial_data)、
+    眼动(eye_data)；呼吸(breath_data) 暂时不入库，见模块级 SAVE_RESP。
 
     接入其他传感器的方式（二选一）：
       1. 直接调用通用接口：recorder.store("spo2_data", [98, 97, ...])
@@ -290,6 +294,32 @@ class DataRecorder:
 
         if decoded.get("电量"):
             self.store(BRACELET_BATTERY_TABLE, decoded["电量"], ts)
+
+    # ------------------------------------------------------------------
+    # 眼动（aSeeStudio 字符串报文）
+    # ------------------------------------------------------------------
+    def record_eye(self, frame, ts=None, use_device_time=False):
+        """写入一帧眼动数据。frame 为 devices.eye_protocol.EyeFrame。
+
+        时间轴怎么取（这是个要明确的选择，别让它含糊）：
+          * 默认写**本机接收时间** —— 与心电/手环/摄像头各表同一个时钟，
+            回放时多表按 time 列对齐才有意义；
+          * 需要严格用眼动仪自己的时钟时传 use_device_time=True，前提是
+            设备时间已和本机同步过，否则回放会对不齐；
+          * 无论哪种，value 里都留了 ts_unix（设备时间）和原始串里的时间戳，
+            事后能反查。
+
+        返回是否真的写了一行（frame 为 None 时返回 False，便于统计丢帧）。
+        """
+        if frame is None:
+            return False
+
+        row = frame.as_row()
+        if use_device_time and frame.timestamp is not None:
+            ts = datetime.fromtimestamp(frame.timestamp).strftime("%Y-%m-%d %H:%M:%S.%f")
+        ts = ts or now_str()
+        self.storage.insert(EYE_TABLE, row, ts)
+        return True
 
     # ------------------------------------------------------------------
     # 其他传感器接入点（示例，按需取消注释并实现）：

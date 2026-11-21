@@ -23,11 +23,38 @@ from __future__ import annotations
 
 import configparser
 import os
+import shutil
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-# 项目根目录：AAAwindows_code/（本文件在 core/ 下）
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _app_root() -> str:
+    """**可写**的根：配置文件与 data/ 都放这里。
+
+    * 源码运行：项目根目录 `AAAwindows_code/`；
+    * PyInstaller 打包后：**exe 所在目录**（不是 `_internal`）—— 这样 config.ini
+      用户可以自己改、data/ 能随文件夹一起拷走备份，也不会被重新打包覆盖。
+    """
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _bundle_root() -> str:
+    """**只读**资源（models/、ui/assets）的根：打包后在 PyInstaller 的解包目录。
+
+    源码运行时与 `_app_root()` 相同；冻结后 `__file__` 指向 `_internal/`，
+    模型权重、图标这类跟着包走的只读文件必须按这个根去找。
+    """
+    if getattr(sys, 'frozen', False):
+        return getattr(sys, '_MEIPASS', _app_root())
+    return _app_root()
+
+
+# 源码运行时两者相同；打包后 PROJECT_ROOT 是 exe 同级，BUNDLE_ROOT 是 _internal
+PROJECT_ROOT = _app_root()
+BUNDLE_ROOT = _bundle_root()
 CONFIG_PATH = os.path.join(PROJECT_ROOT, 'config.ini')
 DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
 
@@ -74,8 +101,13 @@ class Config:
     # ---- 预留设备 ----
     emg_enabled: bool = False
     emg_stream: str = 'BLE_ExG5_TimeSeries'
+    # 眼动仪（aSeeStudio 字符串报文，UDP 一包一帧），解析见 devices/eye_protocol.py
     eye_enabled: bool = False
     eye_udp_port: int = 8003
+    eye_bind: str = '0.0.0.0'           # 监听地址；只想接本机填 127.0.0.1
+    eye_idle_warn: float = 10.0         # 多久没数据就提示（秒）
+    eye_debug: bool = False             # 打印每帧解析结果（联调用）
+    eye_use_device_time: bool = False   # 写库时间轴：False=本机时间，True=设备时间
 
     # ---- 存储 ----
     commit_interval: float = 0.5
@@ -88,9 +120,13 @@ class Config:
     # 这里只在"还想再大一点"时叠加（1.15 / 1.3 比较常用）。
     ui_scale: float = 1.0
 
-    # ---- 摄像头实时打哈欠检测 ----
+    # ---- 摄像头实时人脸检测 / 打哈欠检测 ----
     # 见 vision/ 包与 docs：默认关闭，勾选后才加载模型（首次约 2~5 秒）
-    vision_enabled: bool = True         # 摄像头页默认启用打哈欠检测
+    vision_enabled: bool = True         # 摄像头页默认启用
+    # 只做人脸框选、不判哈欠：True 时只加载人脸检测器（YOLOv8n-face），
+    # 不加载张嘴分类器，也不跑时序状态机；界面「疲劳状态 / 哈欠次数」显示 N/A。
+    # 关掉它（false）才恢复完整的哈欠判定。
+    vision_face_only: bool = True
     vision_interval: float = 0.15        # 推理间隔（秒），约 6~7fps
     vision_threshold: float = 0.5        # 张嘴概率阈值，必须用本地素材标定
     vision_yawn_min_sec: float = 1.5     # 连续张嘴多久算一次哈欠
@@ -104,8 +140,20 @@ class Config:
     @classmethod
     def load(cls, path: Optional[str] = None) -> 'Config':
         """读取 ini 并返回 Config；文件不存在时全部走默认值。"""
+        target = path or CONFIG_PATH
+        # 打包后 exe 同级的 config.ini 可能被用户删掉 / 第一次启动还没生成：
+        # 从包内模板（_internal/config.ini）复制一份出来，保证「配置可编辑」这件事成立。
+        if not os.path.exists(target):
+            template = os.path.join(BUNDLE_ROOT, 'config.ini')
+            if (os.path.abspath(template) != os.path.abspath(target)
+                    and os.path.exists(template)):
+                try:
+                    shutil.copyfile(template, target)
+                except OSError as exc:
+                    print('[配置] 复制模板 config.ini 失败：{}'.format(exc), flush=True)
+
         cp = configparser.ConfigParser()
-        cp.read(path or CONFIG_PATH, encoding='utf-8')
+        cp.read(target, encoding='utf-8')
 
         def get(section: str, option: str, fallback: str = '') -> str:
             return cp.get(section, option, fallback=fallback)
@@ -133,6 +181,10 @@ class Config:
             emg_stream=get('devices', 'emg_stream') or 'BLE_ExG5_TimeSeries',
             eye_enabled=cp.getboolean('devices', 'eye_enabled', fallback=False),
             eye_udp_port=cp.getint('devices', 'eye_udp_port', fallback=8003),
+            eye_bind=get('devices', 'eye_bind') or '0.0.0.0',
+            eye_idle_warn=cp.getfloat('devices', 'eye_idle_warn', fallback=10.0),
+            eye_debug=cp.getboolean('devices', 'eye_debug', fallback=False),
+            eye_use_device_time=cp.getboolean('devices', 'eye_use_device_time', fallback=False),
 
             commit_interval=cp.getfloat('storage', 'commit_interval', fallback=0.5),
             commit_rows=cp.getint('storage', 'commit_rows', fallback=500),
@@ -141,6 +193,7 @@ class Config:
             ui_scale=cp.getfloat('ui', 'scale', fallback=1.0),
 
             vision_enabled=cp.getboolean('vision', 'enabled', fallback=True),
+            vision_face_only=cp.getboolean('vision', 'face_only', fallback=True),
             vision_interval=cp.getfloat('vision', 'interval', fallback=0.15),
             vision_threshold=cp.getfloat('vision', 'threshold', fallback=0.5),
             vision_yawn_min_sec=cp.getfloat('vision', 'yawn_min_sec', fallback=1.5),

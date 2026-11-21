@@ -23,6 +23,8 @@ from typing import Optional
 
 import numpy as np
 
+from core.config import BUNDLE_ROOT
+
 # 与 model_config.py 保持一致
 INPUT_SIZE = (100, 100)
 COLOR_CHANNELS = 1
@@ -32,9 +34,8 @@ COLOR_CHANNELS = 1
 # 真实阈值必须用 tools/vision/calibrate_threshold.py 在本地素材上标定。
 DEFAULT_THRESHOLD = 0.5
 
-DEFAULT_MODEL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'models', 'yawn_model_80.onnx')
+# 模型是包内只读资源，打包后位于 _MEIPASS/models（不能用 __file__ 推导）
+DEFAULT_MODEL = os.path.join(BUNDLE_ROOT, 'models', 'yawn_model_80.onnx')
 
 
 class MouthClassifier:

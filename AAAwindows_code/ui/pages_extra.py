@@ -16,16 +16,17 @@ from typing import Any, Dict, List, Optional, Tuple
 from PyQt5.QtCore import QDateTime, Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (QCheckBox, QComboBox, QDateTimeEdit, QFileDialog, QHBoxLayout,
-                             QHeaderView, QLabel, QPushButton, QTableWidget, QTableWidgetItem,
-                             QVBoxLayout, QWidget)
+                             QHeaderView, QLabel, QPushButton, QTableWidget,
+                             QTableWidgetItem, QVBoxLayout, QWidget)
 
 from analysis.features import analyze_packets
 from core.config import DATA_DIR, Config
+from devices.eye_protocol import (AOI_KEY, AOI_LABEL, FIELD_LABELS, FIELDS)
 from ui import theme
 from ui.base import BasePage
 from ui.replay import (format_size, list_session_folders, list_sessions,
                        load_packets, load_yawn_events)
-from ui.widgets import Card, StatTile, label, mono
+from ui.widgets import Card, StatTile, label, mono, pill
 
 
 # ---------------------------------------------------------------------------
@@ -71,20 +72,163 @@ class EmgPage(ReservedDevicePage):
         return [('emg_enabled', cfg.emg_enabled), ('emg_stream', cfg.emg_stream)]
 
 
-class EyePage(ReservedDevicePage):
+class EyePage(BasePage):
+    """眼动仪（aSeeStudio）：看 UDP 收流是否正常 + 最新一帧解析出来的值。
+
+    解析在 `devices/eye_protocol.py`，接收在 `devices/eye_receiver.py`，
+    这一页只做展示 —— 收包/解析/入库都在后台线程里完成，页面不参与。
+
+    为什么要显示「字段表」而不是只放几个大数字：现场接眼动仪时最常见的两类问题
+    是「端口没对上（收包 0）」和「字段顺序和文档不一致（解析出来但值明显不对）」，
+    把最新一帧的每个字段原样列出来，配着设备端一比就知道是哪一类。
+    """
+
     title = '眼动仪'
     subtitle = ''
-    DEVICE_KEY = 'eye'
-    ENV_FLAG = 'eye_enabled'
-    CHECKLIST = [
-        'devices/eye_receiver.py 里把 SmartEye 解包逻辑补全（骨架已写好）',
-        'core/db_storage.py 增加 data_udp 表',
-        'config.ini 的 [devices] eye_enabled 改 true',
-        '摄像头面捕（瞳孔直径 / 眨眼频率）见「数据分析」页的 n/a 分支，需要人脸关键点模型',
-    ]
 
-    def config_items(self, cfg: Config):
-        return [('eye_enabled', cfg.eye_enabled), ('eye_udp_port', cfg.eye_udp_port)]
+    def build(self) -> None:
+        cfg = Config.load()
+        self.cfg = cfg
+        self.enabled = bool(cfg.eye_enabled)
+
+        head = QHBoxLayout()
+        head.setSpacing(10)
+        self.state_pill = pill('未启用' if not self.enabled else '等待数据',
+                               theme.PALETTE['text_dim'], '#F0F0F0', '#B0B0B0')
+        head.addWidget(self.state_pill)
+        head.addWidget(mono('UDP {}'.format(cfg.eye_udp_port)))
+        self.bind_label = label('', 'CardHint')
+        head.addWidget(self.bind_label)
+        head.addStretch(1)
+        self.peer_label = label('', 'CardHint')
+        head.addWidget(self.peer_label)
+        self.content.addLayout(head)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.tiles: Dict[str, StatTile] = {}
+        for key, title, unit in (('received', '收包', '帧'), ('parsed', '解析成功', '帧'),
+                                 ('failed', '解析失败', '帧'), ('written', '入库', '行'),
+                                 ('rate', '帧率', '帧/秒')):
+            tile = StatTile(title, unit, '--', theme.PALETTE['text_dim'])
+            row.addWidget(tile, 1)
+            self.tiles[key] = tile
+        self.content.addLayout(row)
+
+        card = Card('最新一帧字段')
+        self.table = QTableWidget(len(FIELDS) + 1, 3)
+        self.table.setHorizontalHeaderLabels(['字段', '键', '当前值'])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionMode(QTableWidget.NoSelection)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        self._value_cells: Dict[str, QTableWidgetItem] = {}
+        for row_index, key in enumerate(FIELDS):
+            self.table.setItem(row_index, 0, QTableWidgetItem(FIELD_LABELS[key]))
+            name = QTableWidgetItem(key)
+            name.setForeground(QColor('#888780'))
+            self.table.setItem(row_index, 1, name)
+            cell = QTableWidgetItem('—')
+            self.table.setItem(row_index, 2, cell)
+            self._value_cells[key] = cell
+        aoi_index = len(FIELDS)
+        self.table.setItem(aoi_index, 0, QTableWidgetItem(AOI_LABEL))
+        aoi_key = QTableWidgetItem(AOI_KEY)
+        aoi_key.setForeground(QColor('#888780'))
+        self.table.setItem(aoi_index, 1, aoi_key)
+        self._aoi_cell = QTableWidgetItem('—')
+        self.table.setItem(aoi_index, 2, self._aoi_cell)
+        self.table.resizeRowsToContents()
+        card.body.addWidget(self.table)
+        self.content.addWidget(card, 1)
+
+        self.hint = label('', 'CardHint')
+        self.hint.setWordWrap(True)
+        self.content.addWidget(self.hint)
+
+        if not self.enabled:
+            self.hint.setText('未启用：把 config.ini 的 [devices] eye_enabled 改成 true，'
+                              '或在启动命令后面加 --eye 临时打开。')
+
+    # ------------------------------------------------------------------
+    def on_tick(self, snapshot: Dict[str, Any]) -> None:
+        """每秒刷新一次统计与字段表（眼动 60Hz 也没必要每帧刷界面）。"""
+        service = getattr(self.window_ref, 'eye_service', None)
+        if service is None:
+            if self.enabled:
+                self._set_state('启动失败', theme.PALETTE['red'])
+                self.hint.setText('接收线程没有起来：检查端口 {} 是否被占用'
+                                  '（Windows 上用 netstat -ano | findstr {}）。'
+                                  .format(self.cfg.eye_udp_port, self.cfg.eye_udp_port))
+            return
+
+        stats = service.stats()
+        self.tiles['received'].set_value(str(stats['received']))
+        self.tiles['parsed'].set_value(str(stats['parsed']))
+        failed = stats['failed']
+        self.tiles['failed'].set_value(
+            str(failed),
+            accent=theme.PALETTE['red'] if failed else theme.PALETTE['text_dim'])
+        self.tiles['written'].set_value(str(stats['written']),
+                                        note='写库异常 {} 次'.format(stats['write_errors'])
+                                        if stats['write_errors'] else '')
+        self.tiles['rate'].set_value('{:.1f}'.format(stats['rate']))
+
+        if not stats['bound']:
+            self._set_state('未监听', theme.PALETTE['red'])
+            self.hint.setText(stats['last_error'] or '端口未绑定成功。')
+            return
+        if stats['received'] == 0:
+            self._set_state('监听中，无数据', theme.PALETTE['amber'], '#FDF3E0', '#E0BE8B')
+            self.hint.setText('端口已打开但还没收到包：确认 aSeeStudio 的转发目标地址是'
+                              '本机、端口是 {}。'.format(self.cfg.eye_udp_port))
+            return
+
+        self._set_state('收包中', theme.PALETTE['green'], '#E8F5E9', '#9CCC9F')
+        self.hint.setText(stats['last_error'] if stats['last_error'] else '')
+        self.bind_label.setText('已监听')
+        if stats['peer']:
+            self.peer_label.setText('来源 ' + stats['peer'])
+
+        frame = service.latest()
+        if frame is None:
+            return
+        for key, cell in self._value_cells.items():
+            cell.setText(self._fmt_value(key, getattr(frame, key)))
+        self._aoi_cell.setText('/'.join(frame.aois) if frame.aois else '（空）')
+
+    # ------------------------------------------------------------------
+    def _set_state(self, text: str, color: str, bg: str = '#EEF3F8', border: str = '#C3D3E2') -> None:
+        self.state_pill.setText(text)
+        self.state_pill.setStyleSheet(
+            'border-radius: 2px; padding: 3px 10px; font-size: {};'
+            ' background-color: {}; border: 1px solid {}; color: {};'.format(
+                theme.pt(theme.FS_SMALL), bg, border, color))
+
+    @staticmethod
+    def _fmt_value(key: str, value: Any) -> str:
+        """字段值格式化。
+
+        有效性显示「有效/无效」，事件保持数字（语义未确认，见 eye_protocol 注释），
+        坐标和瞳孔按量级保留小数 —— 归一化坐标要 3 位，毫米 2 位就够。
+        """
+        if value is None:
+            return '—'
+        if key.endswith('_valid'):
+            return '有效' if value else '无效'
+        if isinstance(value, bool):
+            return 'true' if value else 'false'
+        if key in ('gaze_x', 'gaze_y', 'left_x', 'left_y', 'right_x', 'right_y'):
+            return '{:.4f}'.format(value) if abs(value) < 10 else '{:.1f}'.format(value)
+        if key in ('left_pupil', 'right_pupil'):
+            return '{:.2f}'.format(value)
+        if key in ('left_event', 'right_event'):
+            return '{:.0f}'.format(value) if float(value).is_integer() else '{:.2f}'.format(value)
+        return str(value)
+
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +416,11 @@ class AnalysisPage(BasePage):
         body = QHBoxLayout()
         body.setSpacing(8)
         result_card = Card('特征结果')
-        self.result_table = QTableWidget(0, 3)
-        self.result_table.setHorizontalHeaderLabels(['项目', '数值', '备注'])
+        self.result_table = QTableWidget(0, 2)
+        self.result_table.setHorizontalHeaderLabels(['项目', '数值'])
         self.result_table.verticalHeader().setVisible(False)
         self.result_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.result_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.result_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
         result_card.add(self.result_table, 1)
         body.addWidget(result_card, 3)
@@ -464,7 +607,7 @@ class AnalysisPage(BasePage):
             if callable(mark):
                 mark(3)
         else:
-            self.range_hint.setText('三路信号都没有算出指标，看结果表的「说明」')
+            self.range_hint.setText('三路信号都没有算出指标（数据太短或未贴合），换个区间试试')
 
     def reset_results(self) -> None:
         """回退到回放段重新选段时，把上一次的结果清掉，避免看起来还有效。"""
@@ -505,9 +648,12 @@ class AnalysisPage(BasePage):
             rows.append(('    哈欠次数', 'n/a', '没有可用的会话'))
             return rows
         events = load_yawn_events(path, start, end)
-        if events is None:
+        if not events:
+            # 空表也按「没有数据」处理：只框脸模式（[vision] face_only=true）下
+            # 不写 yawn_events，若按 0 次算会得出"正常"，属于无中生有。
             rows.append(('    哈欠次数', 'n/a',
-                         '该会话没有打哈欠记录（录制时未启用检测，或是旧版本录的）'))
+                         '该会话没有打哈欠记录（只框脸模式不判哈欠，或录制时未启用）'))
+            rows.append(('    疲劳分级', 'n/a', '没有哈欠记录，不做分级'))
             return rows
         span = (end - start) if (start and end) else 0.0
         if span <= 0 and len(events) >= 2:      # 没选区间时用首末事件估跨度
@@ -525,14 +671,18 @@ class AnalysisPage(BasePage):
         return rows
 
     def _fill_rows(self, rows: List[Tuple[str, str, str]]) -> None:
+        """只渲染「项目 / 数值」两列。
+
+        数据层每行仍带第三个元素（说明），这里直接丢弃 —— 结果表不再有备注列，
+        原因（电极脱落、数据太短等）也不再展示。保留形参是为了不改所有调用点。
+        """
         self.result_table.setRowCount(len(rows))
-        for index, (name, value, note) in enumerate(rows):
+        for index, (name, value, _note) in enumerate(rows):
             self.result_table.setItem(index, 0, QTableWidgetItem(name))
             value_item = QTableWidgetItem(value)
             if name.startswith('【'):
                 value_item.setForeground(Qt.darkGray)
             self.result_table.setItem(index, 1, value_item)
-            self.result_table.setItem(index, 2, QTableWidgetItem(note))
 
     def export_csv(self) -> None:
         if not self.last_result:
@@ -545,14 +695,13 @@ class AnalysisPage(BasePage):
             return
         # 数据驱动：遍历结果里所有的信号块，下次新增一路不会漏导
         rows = [['区间', '分析时长', '{:.1f} 秒'.format(
-            (self.last_result.get('区间') or (0, 0, 0))[2]), '']]
+            (self.last_result.get('区间') or (0, 0, 0))[2])]]
         for section in self.SECTIONS:
             block = self.last_result.get(section) or {}
             for name, value in (block.get('特征') or {}).items():
-                rows.append([section, name, '' if value is None else value,
-                             block.get('说明', '')])
+                rows.append([section, name, '' if value is None else value])
         with open(path, 'w', newline='', encoding='utf-8-sig') as handle:
             writer = csv.writer(handle)
-            writer.writerow(['模块', '指标', '数值', '备注'])
+            writer.writerow(['模块', '指标', '数值'])
             writer.writerows(rows)
         self.range_hint.setText(f'已导出 {os.path.basename(path)}')

@@ -71,6 +71,8 @@ class YawnSnapshot:
     fps: float = 0.0
     latency_ms: float = 0.0
     threshold: float = 0.5
+    # 只框人脸、不判哈欠：此时 fatigue/yawn_count 无意义，界面显示 N/A
+    face_only: bool = False
 
 
 class YawnState:
@@ -118,6 +120,7 @@ class YawnMonitor(threading.Thread):
                  logic: Optional[YawnLogic] = None,
                  detector: Any = None,
                  classifier: Any = None,
+                 face_only: bool = False,
                  on_event: Any = None,
                  name: str = 'yawn-monitor'):
         super().__init__(name=name, daemon=True)
@@ -129,9 +132,13 @@ class YawnMonitor(threading.Thread):
         # 只认画面中间的人：允许脸中心偏离画面中线多少（按画面宽度的比例）。
         # 0.25 = 中间 50% 宽度这个带子里。旁边的人、背景里的人一律不算。
         self.center_band = float(center_band)
-        self.logic = logic or YawnLogic(threshold=threshold, yawn_min_sec=yawn_min_sec,
-                                        cooldown_sec=cooldown_sec,
-                                        dip_grace_sec=dip_grace_sec)
+        # face_only=True：只跑人脸检测 → 画框；不加载张嘴分类器、不跑哈欠状态机。
+        # 这样既省掉一次模型加载（约 2~5 秒）和每帧分类开销，也不会误报哈欠次数。
+        self.face_only = bool(face_only)
+        self.logic = None if self.face_only else (
+            logic or YawnLogic(threshold=threshold, yawn_min_sec=yawn_min_sec,
+                               cooldown_sec=cooldown_sec,
+                               dip_grace_sec=dip_grace_sec))
         # 判定出一次哈欠时回调：fn({'time': epoch, 'prob': 概率, 'duration': 秒})
         self.on_event = on_event
         self._last_count = 0
@@ -151,26 +158,30 @@ class YawnMonitor(threading.Thread):
         + PyQt5 下会直接触发段错误（实测进程退出码 139，无 Python 异常可抓）。
         导入放到主线程后，工作线程只负责推理，就稳定了。
         """
-        self.state.update(loading=True, error='', state_text='模型加载中…')
+        self.state.update(loading=True, error='', state_text='模型加载中…',
+                          face_only=self.face_only)
         _preload_heavy_modules()
         super().start()
 
     def run(self) -> None:
         state = self.state
         state.update(running=True, loading=True, error='',
-                     threshold=self.logic.threshold)
+                     threshold=self.logic.threshold if self.logic is not None else 0.0,
+                     face_only=self.face_only,
+                     fatigue='na' if self.face_only else 'normal',
+                     fatigue_text='N/A' if self.face_only else '正常')
 
         try:
-            if self._classifier is None or self._detector is None:
-                from vision.face_detector import FaceDetector
-                from vision.mouth_state import MouthClassifier
+            from vision.face_detector import FaceDetector
 
-                if self._classifier is None:
-                    self._classifier = MouthClassifier(threshold=self.logic.threshold).load()
-                if self._detector is None:
-                    self._detector = FaceDetector(backend=self.face_backend,
-                                                  conf=self.face_conf)
-                    self._detector.load()
+            if self._detector is None:
+                self._detector = FaceDetector(backend=self.face_backend,
+                                              conf=self.face_conf)
+                self._detector.load()
+            # 只框脸模式不碰张嘴分类器：少一次模型加载，也就没有张嘴概率可算
+            if not self.face_only and self._classifier is None:
+                from vision.mouth_state import MouthClassifier
+                self._classifier = MouthClassifier(threshold=self.logic.threshold).load()
         except Exception as exc:                          # noqa: BLE001 - 模型问题要显示在界面上
             state.update(running=False, loading=False, error=str(exc))
             return
@@ -182,7 +193,8 @@ class YawnMonitor(threading.Thread):
         try:
             import numpy as _np
             blank = _np.zeros((480, 640, 3), dtype=_np.uint8)
-            self._classifier.predict(blank[100:220, 240:400])   # 黑帧也能预热分类器
+            if self._classifier is not None:
+                self._classifier.predict(blank[100:220, 240:400])   # 黑帧也能预热分类器
             self._detector.detect(blank)
         except Exception:                                 # noqa: BLE001 - 预热失败不影响主流程
             pass
@@ -228,10 +240,31 @@ class YawnMonitor(threading.Thread):
 
         started = time.perf_counter()
         faces = self._detector.detect(frame)
+        main = self._pick_main_face(faces, frame.shape)
+
+        if self.face_only:
+            # 只框人：不做张嘴分类、不推进时序状态机。
+            # 仍然只输出中间那一个人，避免把路过的人框进来干扰观察。
+            boxes: List[tuple] = []
+            if main is not None:
+                boxes = [(main.x1, main.y1, main.x2, main.y2, 0.0)]
+            total_ms = (time.perf_counter() - started) * 1000.0
+            fps = self._update_fps()
+            self.state.update(
+                running=True,
+                error='',
+                state='normal' if main is not None else 'no_face',
+                state_text='已框出人脸' if main is not None else '未检测到人脸',
+                fatigue='na', fatigue_text='N/A',
+                prob=0.0,
+                faces=boxes,
+                fps=round(fps, 1),
+                latency_ms=round(total_ms, 1),
+            )
+            return
 
         prob = 0.0
-        boxes: List[tuple] = []
-        main = self._pick_main_face(faces, frame.shape)
+        boxes = []
         if main is not None:
             roi = frame[main.y1:main.y2, main.x1:main.x2]
             if roi.size:
@@ -251,15 +284,7 @@ class YawnMonitor(threading.Thread):
             self._emit_yawn(status, prob, frame.shape if frame is not None else None)
 
         total_ms = (time.perf_counter() - started) * 1000.0
-        self._frame_times.append(now)
-        cutoff = now - 2.0
-        while self._frame_times and self._frame_times[0] < cutoff:
-            self._frame_times.pop(0)
-        fps = 0.0
-        if len(self._frame_times) > 1:
-            span = self._frame_times[-1] - self._frame_times[0]
-            if span > 0:
-                fps = (len(self._frame_times) - 1) / span
+        fps = self._update_fps()
 
         self.state.update(
             running=True,
@@ -275,6 +300,19 @@ class YawnMonitor(threading.Thread):
             fps=round(fps, 1),
             latency_ms=round(total_ms, 1),
         )
+
+    def _update_fps(self) -> float:
+        """最近 2 秒的实测推理帧率（滑动窗口）。"""
+        now = time.monotonic()
+        self._frame_times.append(now)
+        cutoff = now - 2.0
+        while self._frame_times and self._frame_times[0] < cutoff:
+            self._frame_times.pop(0)
+        if len(self._frame_times) > 1:
+            span = self._frame_times[-1] - self._frame_times[0]
+            if span > 0:
+                return (len(self._frame_times) - 1) / span
+        return 0.0
 
     def _pick_main_face(self, faces: List[Any], shape) -> Any:
         """只挑画面中间那一个人（规则见 vision/face_detector.pick_center_face）。"""
@@ -294,14 +332,21 @@ class YawnMonitor(threading.Thread):
             self.join(timeout)
 
     def reset_counters(self) -> None:
-        """清空哈欠统计（换被试、重新开始采集时用）。"""
-        self.logic.reset()
+        """清空统计（换被试、重新开始采集时用）。"""
+        if self.logic is not None:
+            self.logic.reset()
         self._last_count = 0
-        self.state.update(yawn_count=0, fatigue='normal', fatigue_text='正常')
+        if self.face_only:
+            self.state.update(yawn_count=0, fatigue='na', fatigue_text='N/A')
+        else:
+            self.state.update(yawn_count=0, fatigue='normal', fatigue_text='正常')
 
 
 def describe(snapshot: YawnSnapshot) -> str:
     """一行摘要，便于日志排查。"""
+    if snapshot.face_only:
+        return ('{} · 仅框脸 · {:.1f}fps · {:.1f}ms · {}').format(
+            snapshot.state_text, snapshot.fps, snapshot.latency_ms, snapshot.backend)
     return ('{} · {}/{:.2f} · 哈欠 {} 次 · {:.1f}fps · {:.1f}ms · {}'.format(
         snapshot.state_text, snapshot.fatigue_text, snapshot.prob,
         snapshot.yawn_count, snapshot.fps, snapshot.latency_ms, snapshot.backend))

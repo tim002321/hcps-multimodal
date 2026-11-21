@@ -4,7 +4,7 @@
 不再需要 Linux 盒子转发。
 
 - 心电/手环走 BLE（`bleak`，WinRT 后端，替代原 Linux 版的 `bluepy`）
-- 摄像头走 OpenCV，按目标帧率（默认 30fps）截帧、JPEG 入库
+- 摄像头走 OpenCV，按固定 10fps、640×480 截帧，JPEG 入库
 - 三路数据写进**同一个会话库**，时间轴天然对齐
 - 提供纯采集入口 `main.py` 与实时监测界面 `run_monitor.py`
 
@@ -29,6 +29,8 @@ AAAwindows_code/
 │   ├── bracelet_protocol.py 手环协议解析（纯字节，可离线测）
 │   ├── bracelet_receiver.py 手环接收（BLE）
 │   ├── camera_receiver.py USB 摄像头采集
+│   ├── eye_protocol.py    眼动报文解析（aSeeStudio 字符串，纯函数可离线测）
+│   ├── eye_receiver.py    眼动 UDP 接收 → 解析 → 入库
 │   ├── ble_utils.py       BLE 公共工具（扫描 / 服务表打印）
 │   └── legacy_bracelet.py 手环协议独立调试脚本（主程序不引用）
 ├── ui/                    界面层
@@ -52,17 +54,19 @@ AAAwindows_code/
 │   ├── ble/               扫描、扫描重试策略验证
 │   ├── camera/            摄像头枚举、帧导出
 │   ├── db/                库概览、合并、回放检查、同库验证
+│   ├── eye/               眼动联调（监听 / 假发送端）
 │   ├── vision/            权重下载、离线基准、阈值标定、实时概率探针
 │   ├── test_yawn_pipeline.py  打哈欠状态机断言
+│   ├── test_eye_protocol.py   眼动报文解析断言
 │   └── ui_screenshot.py   离屏截图 + 界面冒烟断言
 ├── docs/                  架构说明 / 需求拆解 / 重构说明 / 手环协议文档
 ├── data/                  运行时生成的会话库
 └── ui_shots/              界面截图
 ```
 
-## 界面结构：三段式向导
+## 界面结构：四段式向导
 
-**没有侧边栏**，整个流程分成三段，一段一屏，用底部按钮推进，上一步没完成进不了下一步：
+**没有侧边栏**，整个流程分成四段，一段一屏，用底部按钮推进，上一步没完成进不了下一步：
 
 ```
 ① 采集 ─→ ② 回放与选段 ─→ ③ 回放观看 ─→ ④ 数据分析
@@ -181,7 +185,7 @@ python run_monitor.py --no-ble                 # 只开界面，稍后在「状�
 1. 扫描蓝牙广播（心电贴 + 绿光手环）
 2. 连接心电贴（bleak，握手后订阅通知）
 3. 连接绿光手环（自动发现通知特征）
-4. 打开 USB 摄像头（cv2，默认 640×480 @30fps）
+4. 打开 USB 摄像头（cv2，固定 640×480 @10fps）
 5. 三个设备都 `connected` 后显示绿色「设备已全部连接，可以开始采集了」
 
 三张卡片实时显示设备状态：未开始 / 扫描中 / 连接中 / **已连接** / 已掉线 / 连接失败，
@@ -277,9 +281,10 @@ python tools/ble/ble_retry_test.py
   手环肤温暂时不在界面露出（`SHOW_SKIN_TEMP = False`），数据仍照常入库。
   点列表某一行，对应那条图标题前会加 `▶` 并滚动到可见位置；点"摄像头帧"则给画面加蓝框。
 
-## USB 摄像头（30fps 入库）
+## USB 摄像头（15fps 入库，照片/视频存文件）
 
-界面第 3 页「摄像头」：选设备号/分辨率/目标帧率/JPEG 质量 → 「开始采集」，
+界面第 3 页「摄像头」：选设备号 / JPEG 质量 → 「开始采集」，
+**分辨率固定 640×480、帧率固定 10fps，界面上都不给改**（原因见下文「采集设置到底改没改到东西」）。
 左边实时预览，右边是设置；顶部显示**已入库帧 / 库大小**。
 页面右上角有**「开始采集」/「结束采集」**两个按钮（每个页面都有）：
 开始 = 扫描蓝牙 + 打开摄像头，结束 = 断开全部设备（设备在跑时开始键置灰，反之亦然）。
@@ -288,11 +293,71 @@ python tools/ble/ble_retry_test.py
 
 ```powershell
 python -m devices.camera_receiver --index 0 --seconds 10 --fps 30
-python -m devices.camera_receiver --index 0 --width 1280 --height 720 --quality 80
+python -m devices.camera_receiver --index 1 --seconds 10 --quality 60
 ```
+（命令行工具本身仍支持 `--width/--height`，只是界面固定 640×480。）
 
 **数据库**：摄像头帧和心电/手环数据**写在同一个会话库**（`data/YYYYmmdd_HHMMSS.db`），
 只是表不同，回放时一起读，时间轴天然对齐。
+
+### 采集设置到底改没改到东西
+
+界面上的两个参数会一路传到 cv2（`CameraPage.current_config()` → `CameraService` → `CameraCapture`）：
+
+| 参数 | 生效方式 | 备注 |
+|---|---|---|
+| 设备号 | `cv2.VideoCapture(index, CAP_DSHOW)` | 打不开自动回退 `CAP_ANY` |
+| JPEG 质量 | `cv2.imencode` 的 `IMWRITE_JPEG_QUALITY` | 直接决定库体积 |
+
+**帧率固定 10fps**（`CameraPage.CAPTURE_FPS`），同样只显示不给选。理由很简单：
+存储按「帧数 × 单帧体积」线性涨，10fps 比 30fps 省掉三分之二。实测对照（同一摄像头、同一场景、各采 12 秒）：
+
+| 目标帧率 | 实际入库帧率 | 单帧体积 | 推算占用 |
+|---|---|---|---|
+| **15 fps** | **14.8 fps** | 27 KB | **1.38 GB/小时** |
+| 30 fps | 26.9 fps | 约 27 KB | 1.70 GB/小时 |
+
+人脸检测每 0.15 秒取一帧（约 6~7fps），与 15fps 采集并行跑互不影响。
+
+**分辨率固定 640×480，界面上不给选**（只显示一行灰字）。三条理由，都是实测出来的：
+
+1. 改分辨率必须重开视频流，DSHOW 下 `set(HEIGHT)` 要 1.5 秒、整个重开 3~4 秒，
+   这段时间画面是断的（回放到这里会静止 3~4 秒）；
+2. 1080p 驱动会忽略 `set` 请求，得靠 `cv2.resize` 兜底，库里记的是目标尺寸、
+   画面却是低分辨率放大，容易误判「设置没生效」；
+3. 人脸/哈欠检测、单帧体积、回放解码都按 640×480 标定，换分辨率没有收益。
+
+**`cap.set(CAP_PROP_FPS)` 也删掉了**。实测它要花 1.56 秒重建视频流，但摄像头原生就是
+30fps，设了也不会变 —— 入库帧率本来就由节拍控制。删掉后「点开始」到首帧从 4.6 秒降到 3.2 秒。
+
+**首帧要等 2~4 秒是正常的**：`VideoCapture` 初始化约 1.3 秒，`set(HEIGHT)` 约 1.5 秒。
+这期间页面显示「正在打开摄像头…」，超过 15 秒还没画面就判定被相机/会议软件占用。
+
+**设置会记住**：点「开始采集」时写进 `data/camera_prefs.json`，下次启动回填到控件。
+不写回 `config.ini` —— configparser 回写会把文件里的中文注释全丢掉（同 `ui/profile.py`）。
+
+**改完立即生效**，不用停掉再点开始。因为分辨率和帧率都固定了，现在只有一处会触发重开：
+
+| 改什么 | 怎么生效 | 画面 |
+|---|---|---|
+| JPEG 质量 | 只改内存参数，下一帧起按新值走 | 不中断 |
+| 设备号 | 重开视频流（DSHOW 下约 3 秒） | 冻结约 3 秒，状态灯显示「正在应用新设置…」 |
+
+防抖 500 ms，拖数字框不会连续重启。质量是热改的，所以预览下方那行会直接显示当前
+生效的 `Q60`，改完立刻能看到数字变了。
+
+**真实输出尺寸**：`camera_frames.width/height` 是**编码后**的尺寸，
+`camera_sessions.width/height` 记的是摄像头**真实输出**。两者不一致说明 `cap.set()` 被驱动
+忽略 —— 预览下方那行会标出「摄像头实采 320×240（已放大）」这类提示。
+
+**照片与视频存在哪**（不进数据库）：
+
+```
+data/<姓名>/<任务名>_<时间戳>/
+├── 20261114_111026.db     会话库：心电/手环 + camera_frames 元数据（几十 KB）
+├── frames/                照片 20261114_111026_123456_000001.jpg
+└── video/                 视频 video_20261114_111026.mp4
+```
 
 ```sql
 CREATE TABLE camera_frames (
@@ -301,30 +366,46 @@ CREATE TABLE camera_frames (
     camera TEXT,
     frame_index INTEGER NOT NULL,  -- 从 1 递增
     width INTEGER, height INTEGER,
-    jpeg BLOB NOT NULL             -- 原始 JPEG 字节，cv2.imdecode 即可
+    file_name TEXT NOT NULL        -- frames/ 下的文件名，不再存图片字节
 );
 CREATE TABLE camera_sessions (
     id, started_at, ended_at, camera, width, height, target_fps, frame_count
 );
+CREATE TABLE camera_videos (
+    id, started_at, ended_at, camera, width, height,
+    fps, frame_count, duration, file_name
+);
 ```
+
+**为什么改成文件**：以前 JPEG 直接进 BLOB，一个 1 小时的会话库就是 1~2 GB，
+回放时要把整库图片读进内存（15fps 跑 1 小时约 1.9 GB 常驻）。现在库里只有几十 KB
+元数据，回放逐帧读盘；拷数据时库和图一起在会话目录里，删会话也不会留孤儿文件。
+
+**视频**：与采集**同源同帧**，15fps / 640×480，编码优先 `mp4v`、失败自动降级 `MJPG/avi`。
+打包产物里没有 openh264，所以不能用 H.264。丢帧时按真实时间戳补上一帧，保证视频时长
+与墙上时间一致（单次最多补 6 帧，长卡顿不硬填）。
+
+**老库兼容**：以前存 BLOB 的库仍能回放（读侧按 `PRAGMA table_info` 判断走哪条分支），
+不改旧表、不做迁移。
 
 **帧率控制**：摄像头若比目标帧率快（例如 60fps），超出的帧直接跳过；
 采样按固定节拍推进，不会把 JPEG 编码耗时算进周期（否则实测只有 20fps）。
 
-**给分析用**：导出入库的帧
+**给分析用**：导出入库的帧（新旧库都支持，新库直接从 frames/ 复制）
 
 ```powershell
-python tools/camera/export_camera_frames.py data/camera_20261017_143135.db
-python tools/camera/export_camera_frames.py data/camera_xxx.db --out frames --every 30   # 每秒取 1 张
+python tools/camera/export_camera_frames.py data/<会话>.db
+python tools/camera/export_camera_frames.py data/<会话>.db --out my_frames --every 15   # 每秒取 1 张
 ```
 
-> 存储估算：640×480 / JPEG80 ≈ 25~40KB/帧 → 30fps ≈ 0.8~1.2MB/s（约 3~4GB/小时）；
-> 1280×720 约翻倍。长时间录制建议调低质量或改成「存文件 + 库里存路径」。
+> 存储估算：640×480 / JPEG80 ≈ 18~35KB/帧 → **15fps 照片 ≈ 1.0~1.9 GB/小时**，
+> 再加视频约 0.2 GB/小时。想再压就调低 JPEG 质量（Q80→Q60 单帧约省 40%），比降帧率更划算。
 
-验证两类数据确实同库（不需要硬件）：
+验证存储结构（不需要硬件）：
 
 ```powershell
-python tools/db/test_shared_db.py
+python tools/db/test_media_storage.py   # 照片落盘/表结构/视频/缺帧容错/老库兼容
+python tools/db/test_shared_db.py       # 传感器数据与照片/视频同会话目录、回放时间轴可合并
 ```
 
 没有硬件时用 `--replay` 或第②段的回放面板；截图自检：
@@ -341,20 +422,26 @@ python tools/ui_screenshot.py     # 用历史数据填满界面，按「阶段 +
 多数是固定 0，存进去只会在回放里多一条直线。实时曲线不受影响（数据走 `LiveBuffers`），
 只是库里没有 `breath_data` 表、回放页也不会列「呼吸」这一项。要恢复改成 `True`。
 
-## 打哈欠检测（疲劳监测）
+## 人脸检测 / 打哈欠检测
 
-「摄像头」页可以在实时画面上检测打哈欠，作为疲劳监测的一路指标。
-**默认开启**（`config.ini` 的 `[vision] enabled=true`）：进页面时勾选框已勾上，
-点「开始采集」后自动加载模型（首次约 2~4 秒，含预热）。不想用就取消勾选。
+「摄像头」页会在实时画面上检测人脸并画框，**开始采集即自动生效，界面上没有开关**。
+当前只框脸、不判哈欠（`config.ini` 的 `[vision] face_only=true`）：只加载人脸检测器，
+不加载张嘴分类器，也不写 `yawn_events` 表；界面上不显示疲劳/哈欠相关指标。
+
+需要恢复完整的哈欠判定时，把 `[vision] face_only` 改成 `false`，重启程序即可：
+会额外加载张嘴分类器（首次 2~5 秒），并跑下面的时序状态机（哈欠次数写进
+`yawn_events`，可在数据分析页按会话查看）。
 
 ### 原理与选型
 
 ```
-摄像头帧 → YOLOv8n-face 检人脸（GPU/CPU）→ 只取画面中间那一个人 → 裁人脸 ROI
-        → HippoYD 判张嘴概率（ONNX，经 cv2.dnn，约 2~5ms）
+摄像头帧 → YOLOv8n-face 检人脸（GPU/CPU）→ 只取画面中间那一个人 → 画绿框
+        → [face_only=false 时才走下面两步]
+        → 裁人脸 ROI → HippoYD 判张嘴概率（ONNX，经 cv2.dnn，约 2~5ms）
         → 时序状态机（连续张嘴 ≥1.5s 才算一次哈欠，容错 0.3s，冷却 5s）
-        → 界面：人脸框 + 疲劳状态 + 哈欠次数
 ```
+
+只框脸模式下画的是统一绿色框，不标概率数字（没有张嘴概率可标）。
 
 ### 只识别画面中间的人
 
@@ -493,7 +580,169 @@ torch 自带一份 OpenMP / protobuf / abseil 原生库。如果先初始化了 
 - **侧脸/低头会漏检**。界面会把「未检测到人脸」单独显示，不会当成"没打哈欠"。
 - 阈值与 `yawn_min_sec` 都是经验参数，换场景（摄像头位置、光照）要重新标定。
 - 检测结果**只显示、不入库**。要沉淀数据需另加表（当前版本未做）。
-- 只取画面中面积最大的那张脸，多人同框时其他人不参与判定。
+- 只识别**画面中间**的那个人（`[vision] center_band=0.25`）。中间带里出现多张脸时
+  这一帧不判定，不会随便挑一张。
+
+## 眼动仪（aSeeStudio UDP）
+
+aSeeStudio 通过 UDP 端口转发，**一包一帧、纯字符串、没有换行符**。实测报文是
+JSON 数组，15 项：
+
+```
+[1782367662834217, true, 0.645575, 1.0662, true, 0.618701, 0.984101,
+ true, 0.672449, 1.1483, 3.51215, 2.34143, 0, 0, []]
+```
+
+| 序号 | 字段 | 说明 |
+| --- | --- | --- |
+| 1 | 时间戳 | **微秒**（16 位），不是毫秒 |
+| 2 | 综合注视点是否有效 | bool |
+| 3 / 4 | 综合注视点 X / Y | 归一化坐标，**Y 可以超过 1.0**（视线出屏） |
+| 5 | 左眼注视是否有效 | bool |
+| 6 / 7 | 左眼注视点 X / Y | 同上 |
+| 8 | 右眼注视是否有效 | bool |
+| 9 / 10 | 右眼注视点 X / Y | 同上 |
+| 11 / 12 | 左 / 右眼瞳孔直径 | 毫米，两眼可差 1mm 以上 |
+| 13 / 14 | 左 / 右眼事件状态 | 语义未确认，见下 |
+| 15 | AOI 名称 | 数组，可为空、可多个 |
+
+厂商文档给的另一种写法是花括号包引号 `{"时间戳","推荐眼注视点是否有效",...}`，
+解析器也认（先按 JSON 解析，失败再按分隔符拆）。代码在 `devices/eye_protocol.py`。
+
+### 三个必须知道的点
+
+1. **时间戳是微秒**。按毫秒算会把 2026 年解析成 58000 年，回放时间轴全废。
+   `normalize_time()` 用 1e14 做分界区分微秒/毫秒/秒。
+2. **Y 坐标会超过 1.0**。实测样本是 1.0662，这是视线出屏的正常现象，
+   不要做 `min(1.0, y)` 之类的裁剪，会把出屏数据压平。
+3. **第 13/14 字段语义没定**。厂商文档叫「左/右眼眨眼状态」，实测样本的注释是
+   「事件/触发状态，尚未确认」。所以代码里字段名是 `left_event` / `right_event`，
+   **原样存数字、不转 bool**，`frame.blinking` 只是推测值。
+   眨眼频率这类结论暂时不要基于它出。
+
+### 配置与启动
+
+```ini
+[devices]
+eye_enabled=true        # 打开才会监听
+eye_udp_port=8003       # 要和 aSeeStudio 里配的转发端口一致
+eye_bind=0.0.0.0        # 只想接本机就填 127.0.0.1
+eye_idle_warn=10        # 多久没数据就提示（秒）
+eye_debug=false         # 逐帧打印解析结果，联调时开
+eye_use_device_time=false   # 写库用本机时间（推荐），true 用设备时间
+```
+
+不改配置也能临时打开：
+
+```bash
+python run_monitor.py --eye          # 临时监听（覆盖 eye_enabled=false）
+python run_monitor.py --no-eye       # 临时关掉
+```
+
+### 落库
+
+一帧一行，表名 `eye_data`，沿用统一的 `(time, value)` 两列结构，`value` 是整帧 JSON：
+
+```json
+{"gaze_valid": true, "gaze_x": 0.645575, "left_pupil": 3.51215, "right_pupil": 2.34143,
+ "left_event": 0.0, "aoi": ["中心区"], "ts_unix": 1782367662.834217, "ts_raw": "1782367662834217"}
+```
+
+`time` 列写**本机接收时间**，与心电/手环/摄像头同一个时钟，回放时多表才能对齐；
+设备原始时间放在 `ts_unix`（秒）和 `ts_raw`（原串）里，事后可反查。
+
+### 独立采集 + 事后合并（设备只出 TCP 时）
+
+设备只往外推 TCP、主程序只收 UDP 时，**不用改主程序**也能把眼动并进会话库：
+
+```bash
+# 1) 采：另开一个窗口，独立脚本把眼动存成 CSV（与主程序同时开始、同时结束）
+python receive_tcp_5001.py --no-raw
+
+# 2) 合：把会话目录传进去，自己找同时间段的 CSV 并导入
+python tools/eye/import_eye_csv.py --db data/张三/任务A_20261117_171900 --write
+```
+
+不给 `--db` 就挑 `data` 下最新的会话库；`--db` 可以给 `.db` 文件，也可以给会话目录
+（目录里有多个库时取最新的）。不给 CSV 时，在「会话目录 → 上一级 → 项目根 →
+程序目录 → 当前目录」里按**与会话时间窗的重叠时长**挑最合适的那个。
+
+先看配对情况（不写库）：
+
+```bash
+python tools/eye/import_eye_csv.py --list
+```
+
+输出每个会话的时间窗、能配上的 CSV、重叠秒数、以及该会话已导入多少行眼动。
+
+**三条硬约束**
+
+1. **同时采集**：会话库的时间窗是「最早一条数据 ~ 最晚一条数据」。CSV 超出这个窗口
+   的行会被裁掉（`--no-clip` 可关，但会留下时间轴外的孤立数据）。两边差太多时脚本
+   直接拒绝并提示。
+2. **同一台电脑**：时间重建的锚点取「CSV 首帧的本机接收时刻」，换机器时钟差未知，
+   整段会整体平移。
+3. **幂等**：目标窗内已有 `eye_data` 时默认拒绝写入；确认追加才加 `--append`。
+
+**时间为什么要重建**
+
+CSV 的「本机时间」列不能直接当 `time` 用：TCP 是流式的，一次 `recv` 常拿到十几帧，
+实测 **39% 的相邻帧时间戳完全相同**、最大空档 217 ms。导入时按设备毫秒时间重建：
+
+```
+time[i] = 首帧本机时刻 + (dev_ms[i] - dev_ms[0]) / 1000
+```
+
+实测（3790 帧真实数据）：重建后间隔中位 8.0 ms（恢复设备原始节拍），与 CSV 本机时间
+的偏差中位 14 ms / P95 16 ms —— 是稳定的网络延迟，不是抖动。导入后 100% 的行能在
+±10 ms 内找到对应的心电采样。
+
+`--time fit` 用全部帧做最小二乘拟合（可抵消设备与本机时钟的轻微漂移），
+`--time local` 直接用 CSV 本机时间（不推荐）。
+
+**导入后的 `value`**
+
+设备原始字段一个不丢（25 个），另加归一化键 `gaze_valid/gaze_x/gaze_y/left_pupil/
+right_pupil`、`ts_unix/ts_raw`，以及 `src: "csv-import"` —— 事后能分清哪些行是导入的。
+
+**两个坑**
+
+- 去重按「整帧 JSON 完全相同」，**不能按设备时间去重**：实测 11% 的相邻帧时间戳重复，
+  按时间去重会误删（这次 3790 帧里就有 419 帧同时间戳，去重实际只删掉 41 帧完全重复的）。
+- 用 SQL 做亚秒比较要用 `julianday()`，`datetime()` 会把小数秒丢掉：
+
+  ```sql
+  SELECT COUNT(*) FROM eye_data e JOIN ecg_data c
+   ON ABS(julianday(c.time) - julianday(e.time)) * 86400 <= 0.01;
+  ```
+
+**没设备时怎么验证**：`tools/eye/replay_eye_csv.py` 能把录下来的 CSV 还原成原始 JSON
+帧、按原始节奏发 TCP，让 `receive_tcp_5001.py` 去连——实测 3790 帧逐字段零差异。
+
+### 联调（没有设备也能跑通）
+
+```bash
+# 1) 单独监听，看解析结果与统计（不开界面、不落库）
+python tools/eye/listen_eye.py --seconds 10
+
+# 2) 顺便落库，验证 JSON 结构（库在系统临时目录，不污染 data/）
+python tools/eye/listen_eye.py --save --seconds 10
+
+# 3) 完全没有设备时：另开一个窗口造帧，把整条链路跑通
+python tools/eye/fake_eye_sender.py --seconds 5
+
+# 4) 解析器自检（42 项断言，不需要设备/网络）
+python tools/test_eye_protocol.py
+```
+
+界面上的「眼动仪」页会显示收包/解析/失败/入库四个计数和最新一帧的每个字段，
+现场排查「端口没对上」和「字段顺序不对」都是看这一页。
+
+### 已知限制
+
+- 只做接收与存档，**没有眼动指标分析**（注视时长、扫视、AOI 停留统计都还没有）。
+- 帧率没有上下限保护：aSeeStudio 发多快就存多快，60Hz 一分钟约 4MB。
+- 不做逐帧去重：设备重发同一帧会存两条。
 
 ## 数据包格式（244 字节）
 
@@ -535,6 +784,47 @@ torch 自带一份 OpenMP / protobuf / abseil 原生库。如果先初始化了 
   }
 }
 ```
+
+## 打包成可迁移软件（PyInstaller）
+
+给不装 Python 的机器用时，打成 onedir 文件夹：
+
+```bash
+python build_exe.py            # 完整构建，约 10~20 分钟，产物约 6GB
+python build_exe.py --skip-build   # 只重做产物后处理
+```
+
+产物 `dist/HcpsMonitor/`：
+
+```
+HcpsMonitor.exe      双击运行（无控制台窗口）
+config.ini           可编辑；删了会自动从 _internal 复制一份默认的回来
+data\                采集数据（跟 exe 同级，整个文件夹拷走就连数据一起带走）
+logs\app.log         运行日志 —— 无控制台模式下的 stdout/stderr 都写这里
+使用说明.txt
+_internal\           依赖 + 模型权重（torch CUDA、PyQt5、Qt 插件、models/）
+```
+
+**为什么不是单文件 exe**：单文件每次启动都要把 6GB 解压到临时目录，实测要几十秒，
+而且 `data\` 会落进临时目录、退出即删。onedir 双击秒开，数据也在自己旁边。
+
+打包相关的三处代码改动（都是必须的，不打包时无副作用）：
+
+| 改动 | 原因 |
+|---|---|
+| `core/config.py` 拆 `PROJECT_ROOT`（exe 同级可写）/ `BUNDLE_ROOT`（`_MEIPASS` 只读资源） | 原来的 `__file__` 推导在冻结后指向 `_internal\`，config.ini 读不到、data 会写进包内 |
+| `run_monitor.py` 的 `_setup_frozen_stdio()` | windowed 模式 `sys.stdout is None`，项目里几十处 `print(..., flush=True)` 会抛 AttributeError（表现为双击闪退） |
+| `core/preflight.py` 冻结后早退 | exe 里没有 venv / pip，原来的"去装 requirements"指引只会误导，而且写 stderr 看不见 |
+
+打包时的依赖取舍：
+- **带 CUDA torch**（约 4.3GB），人脸检测走 GPU；目标机没显卡时 ultralytics 自动回退 CPU
+- **排除** `pylsl`、`serial`（主程序从不 import）、`tkinter`、`IPython`/`jupyter`
+- **显式收集** `winrt`（bleak 3.x 的 WinRT 后端，官方没有钩子）、`ultralytics` 全部子模块
+
+注意事项：
+1. 交付时**拷贝整个文件夹**，不能只拷 exe；
+2. 部分杀毒软件对 PyInstaller 产物误报，加信任即可；
+3. 现场出问题先看 `logs\app.log`，再考虑用 `console=True` 重打一版抓栈。
 
 ## 常见问题
 

@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from core import media_paths as media
 from core.db_storage import db_total_size, is_empty_db
 from ui.buffers import LiveBuffers
 
@@ -223,19 +224,71 @@ def _tables(conn: sqlite3.Connection) -> List[str]:
         "SELECT name FROM sqlite_master WHERE type='table'")]
 
 
-def load_camera_rows(db_path: str) -> List[tuple]:
-    """读一个库里的摄像头帧 [(time, frame_index, jpeg)]；没有表返回空。"""
+def camera_columns(conn: sqlite3.Connection) -> set:
+    """camera_frames 的列名集合；没有这张表返回空集。"""
+    if 'camera_frames' not in _tables(conn):
+        return set()
+    return {row[1] for row in conn.execute('PRAGMA table_info(camera_frames)')}
+
+
+def camera_frame_refs(db_path: str) -> List[Dict[str, Any]]:
+    """只读元数据，返回「这一帧怎么取」，**不把图片读进内存**。
+
+    新库（照片存文件）：{'time','frame_index','jpeg_path'}
+    老库（jpeg BLOB）  ：{'time','frame_index','jpeg'}
+    两者都有列时优先 file_name，空串回落到 jpeg。
+
+    为什么要这样拆：一次 1 小时的 15fps 采集有 5 万多帧，若在这里读成 list，
+    回放光图片就要占 2GB 常驻内存。调用方按需逐帧读盘即可。
+    """
     if not os.path.exists(db_path):
         return []
     conn = sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
     try:
-        if 'camera_frames' not in _tables(conn):
+        cols = camera_columns(conn)
+        if not cols:
             return []
-        return conn.execute(
-            'SELECT time, frame_index, jpeg FROM camera_frames ORDER BY frame_index'
-        ).fetchall()
+        # 按 id（自增主键 = 插入顺序）排，**不能按 frame_index**：
+        # 采集中途改分辨率/设备号会重开一路 CameraCapture，新的一路帧号从 0 重新计，
+        # 按帧号排会把两段数据交错在一起 —— 实测「时间倒退 2 次、画面来回跳」。
+        if 'file_name' in cols:
+            base = media.frames_dir(db_path)
+            refs: List[Dict[str, Any]] = []
+            for ts, index, name in conn.execute(
+                    'SELECT time, frame_index, file_name FROM camera_frames ORDER BY id'):
+                ref: Dict[str, Any] = {'time': ts, 'frame_index': index}
+                if name:
+                    ref['jpeg_path'] = os.path.join(base, name)
+                else:
+                    ref['jpeg'] = b''
+                refs.append(ref)
+            return refs
+        if 'jpeg' in cols:
+            return [{'time': ts, 'frame_index': index, 'jpeg': jpeg or b''}
+                    for ts, index, jpeg in conn.execute(
+                        'SELECT time, frame_index, jpeg FROM camera_frames ORDER BY id')]
+        return []
     finally:
         conn.close()
+
+
+def load_camera_rows(db_path: str) -> List[tuple]:
+    """读一个库里的摄像头帧 [(time, frame_index, jpeg)]；没有表返回空。
+
+    签名与老版本一致（tools 里的导出/合并脚本不用改），内部按需读盘。
+    小规模用它可以；回放主路径用 camera_frame_refs + 逐帧读，避免整库进内存。
+    """
+    rows: List[tuple] = []
+    for ref in camera_frame_refs(db_path):
+        jpeg = ref.get('jpeg')
+        if jpeg is None:
+            try:
+                with open(ref['jpeg_path'], 'rb') as fp:
+                    jpeg = fp.read()
+            except (OSError, KeyError):
+                jpeg = b''
+        rows.append((ref['time'], ref['frame_index'], jpeg))
+    return rows
 
 
 def find_camera_companion(db_path: str, max_seconds: float = 900.0) -> Optional[str]:
@@ -301,21 +354,20 @@ def load_db_packets(db_path: str, limit_seconds: Optional[float] = None,
         battery_groups = (_load_groups(conn, BRACELET_TABLES['battery'])
                           if 'battery' in want else empty)
         tables = _tables(conn)
-        camera_rows = []
-        if 'camera' in want and 'camera_frames' in tables:
-            camera_rows = conn.execute(
-                'SELECT time, frame_index, jpeg FROM camera_frames ORDER BY frame_index'
-            ).fetchall()
+        # 摄像头帧只取"引用"，图片等回放真正用到时再逐帧读盘（见 camera_frame_refs）
+        has_camera = 'camera' in want and 'camera_frames' in tables
     finally:
         conn.close()
 
+    camera_refs: List[Dict[str, Any]] = camera_frame_refs(db_path) if has_camera else []
+
     # 兼容旧数据：老版本把帧单独存在 camera_YYYYmmdd_HHMMSS.db 里，
     # 这里按时间就近配对，让一次回放也能同时拿到摄像头画面
-    if not camera_rows and 'camera' in want:
+    if not camera_refs and 'camera' in want:
         companion = find_camera_companion(db_path)
         if companion:
-            camera_rows = load_camera_rows(companion)
-            if camera_rows:
+            camera_refs = camera_frame_refs(companion)
+            if camera_refs:
                 print('[回放] 会话库没有摄像头帧，自动配对 {}'.format(os.path.basename(companion)),
                       flush=True)
 
@@ -344,9 +396,8 @@ def load_db_packets(db_path: str, limit_seconds: Optional[float] = None,
         packets.append((_to_epoch(ts), 'bracelet', {'肤温': values[0]}))
     for ts, values in sorted(battery_groups.items()):
         packets.append((_to_epoch(ts), 'bracelet', {'电量': values[0]}))
-    for ts, frame_index, jpeg in camera_rows:
-        packets.append((_to_epoch(ts), 'camera',
-                        {'jpeg': jpeg, 'frame_index': frame_index, 'time': ts}))
+    for ref in camera_refs:
+        packets.append((_to_epoch(ref['time']), 'camera', ref))
 
     packets.sort(key=lambda item: item[0])
     if time_range:
@@ -567,8 +618,17 @@ class ReplayPlayer(threading.Thread):
                 elif kind == 'bracelet':
                     self.buffers.publish_bracelet(decoded)
                 elif kind == 'camera':
+                    # 新库只存文件名：真正播到这一帧才读盘，避免整库图片常驻内存。
+                    # 文件被删或挪走时给空帧，回放继续，不中断。
+                    jpeg = decoded.get('jpeg')
+                    if jpeg is None:
+                        try:
+                            with open(decoded.get('jpeg_path') or '', 'rb') as fp:
+                                jpeg = fp.read()
+                        except (OSError, TypeError):
+                            jpeg = b''
                     self.buffers.publish_camera_frame(
-                        decoded.get('jpeg', b''), decoded.get('frame_index', 0),
+                        jpeg or b'', decoded.get('frame_index', 0),
                         decoded.get('time', ''))
             if not self.loop:
                 return

@@ -22,6 +22,7 @@ from typing import Any, Dict
 STATE_TEXT = {
     'idle': '未开始',
     'scanning': '扫描中',
+    'listening': '监听中',      # UDP 收流（眼动）：端口开着，等设备往这里发
     'connecting': '连接中',
     'connected': '已连接',
     'lost': '已掉线',

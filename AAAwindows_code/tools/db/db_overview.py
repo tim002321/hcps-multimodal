@@ -12,10 +12,16 @@ import argparse
 import glob
 import os
 import sqlite3
+import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 DATA_DIR = os.path.join(ROOT, 'data')
+
+from core import media_paths as media                      # noqa: E402
+from ui.replay import format_size                          # noqa: E402
 
 
 def count(conn, table):
@@ -35,13 +41,14 @@ def main() -> int:
     if not paths:
         print('data/ 下没有数据库')
         return 1
-    print('{:<34} {:<12} {:>7} {:>8} {:>8}'.format('库文件', '修改时间', '摄像头', '心电', '手环PPG'))
+    print('{:<30} {:<12} {:>6} {:>7} {:>7} {:>9}'.format(
+        '库文件', '修改时间', '照片', '心电', '手环PPG', '照片+视频'))
     print('-' * 78)
     for path in paths:
         try:
             conn = sqlite3.connect('file:{}?mode=ro'.format(path), uri=True)
         except sqlite3.Error as exc:
-            print('{:<34} 打不开：{}'.format(os.path.basename(path), exc))
+            print('{:<30} 打不开：{}'.format(os.path.basename(path), exc))
             continue
         try:
             camera = count(conn, 'camera_frames')
@@ -50,8 +57,10 @@ def main() -> int:
         finally:
             conn.close()
         stamp = time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(path)))
-        print('{:<34} {:<12} {:>7} {:>8} {:>8}'.format(
-            os.path.basename(path), stamp, camera, ecg, ppg))
+        # 照片/视频不在库里，单独统计目录体积
+        extra = format_size(media.media_bytes(path))
+        print('{:<30} {:<12} {:>6} {:>7} {:>7} {:>9}'.format(
+            os.path.basename(path), stamp, camera, ecg, ppg, extra))
     return 0
 
 

@@ -14,6 +14,8 @@ import os
 import re
 from typing import List, Optional
 
+from core.config import BUNDLE_ROOT
+
 PALETTE = {
     'bg': '#ECECEC',
     'panel': '#FFFFFF',
@@ -38,7 +40,8 @@ PALETTE = {
 FONT_UI = 'Microsoft YaHei'
 FONT_MONO = 'Consolas'
 FONT_FILES = ['msyh.ttc', 'msyhbd.ttc', 'simsun.ttc', 'consola.ttf', 'segoeui.ttf']
-ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+# 图标等只读资源跟着包走：源码运行时在项目根，打包后在 _MEIPASS 里
+ASSETS_DIR = os.path.join(BUNDLE_ROOT, 'ui', 'assets')
 
 # ---------------------------------------------------------------------------
 # 字号与尺寸
