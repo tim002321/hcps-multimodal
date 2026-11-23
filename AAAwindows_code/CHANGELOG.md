@@ -7,6 +7,42 @@
 
 ---
 
+## v1.0.1 — 2026-11-23
+
+### 结构调整：调试工具移出主程序目录
+
+主程序目录不再包含任何 `tools/`，符合「客户版只放客户需要的东西」这条约束。
+
+| 变化 | 说明 |
+|---|---|
+| 目录迁移 | `AAAwindows_code/tools/` → 仓库根 `debug_tools/`（`ble` / `eye` / `db` / `camera` / `vision` 五个子目录与三个顶层脚本整体搬迁，用 `git mv` 保留文件历史） |
+| 眼动采集脚本 | `AAAwindows_code/receive_tcp_5001.py` → `debug_tools/eye/receive_tcp_5001.py`，与工具箱同目录，导入不再跨目录 |
+| 路径推导 | 所有工具改为「上溯到仓库根再拼 `AAAwindows_code`」，仓库整体搬迁无需改路径 |
+| 打包脚本 | `eye_build/eye_toolbox.spec` 的 `TOOLS` 指向 `debug_tools/eye` |
+| 通用脚本 | 文档转 PDF 工具移至 `scripts/md2pdf.py`，与设备排障工具区分开 |
+
+**验证**：全部脚本编译通过；`receive_tcp_5001 --selftest` 8/8、`test_eye_protocol` 42/42、
+`test_yawn_pipeline` 23/23；`fetch_models --check` 正确定位 `AAAwindows_code/models`；
+`diag_ecg --scan 3` 正确读取 `config.ini` 的 15 个设备名。
+
+> 注意：本文件历史条目中的 `tools/...` 路径，指迁移前的位置。
+
+### 新增：安全与协作基线
+
+| 项目 | 内容 |
+|---|---|
+| 凭据脱敏 | `AAA_HcpsApp/config/default.yaml` 的 SSH 用户名与口令改为空值 + 环境变量说明；审查报告中引用凭据与内网 IP 的 4 处改为脱敏表述 |
+| 被试信息 | `face_tool` 文档与测试中的真实姓名改为匿名编号 `sub-014`；样本路径改由 `HCP_SAMPLE_SESSION` 环境变量提供 |
+| `.gitattributes` | 统一 `eol=lf`，二进制显式标记，避免跨平台整文件 diff |
+| `CONTRIBUTING.md` | 分支命名、提交格式、禁止提交清单、两个冲突高发文件的处理约定 |
+| `.gitignore` | 新增取数口令、密钥、`_pdfsrc/` 等规则 |
+
+### 修复
+
+`debug_tools/ble/ecg_probe_gui.py`：会话级统计跨重连不清零，掉线日志补记持续时长。
+
+---
+
 ## 2026-11-21
 
 ### 新增：心电贴诊断与检测工具（独立运行，不改主程序）
