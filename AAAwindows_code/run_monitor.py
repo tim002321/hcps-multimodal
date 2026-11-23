@@ -159,11 +159,219 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument('--ui-scale', type=float, default=None,
                         help='界面字号倍率（1.0 = 默认；觉得字还小就试 1.15 / 1.3）。'
                              '也可用环境变量 HCP_UI_SCALE')
+    parser.add_argument('--selftest', action='store_true',
+                        help='部署自检：依赖/模型/数据目录/融合管线逐项检查，'
+                             '结果写到程序目录的 selftest.log 后退出（不开界面）')
     return parser.parse_args(argv)
+
+
+def run_selftest() -> int:
+    """部署自检：换了电脑、换了目录之后先跑这个。
+
+    检查项：路径布局 → 配置 → 数据目录可写 → Qt → 模型文件 → 推理后端 → 融合管线。
+    结果同时打印和写到程序目录的 selftest.log（打包成窗口程序后看不到控制台）。
+    """
+    import platform
+    import traceback
+
+    from core import paths
+
+    lines: list = []
+
+    def log(text: str = '') -> None:
+        print(text, flush=True)
+        lines.append(text)
+
+    ok = True
+    log('=' * 66)
+    log('HCPS 采集程序 · 部署自检')
+    log('=' * 66)
+    log('时间      : {}'.format(__import__('datetime').datetime.now()
+                                .strftime('%Y-%m-%d %H:%M:%S')))
+    log('Python    : {}'.format(sys.version.split()[0]))
+    log('平台      : {} / {}'.format(platform.system(), platform.machine()))
+    log('打包运行  : {}'.format(paths.FROZEN))
+    log('程序目录  : {}'.format(paths.APP_DIR))
+    log('资源目录  : {}'.format(paths.BUNDLE_DIR))
+
+    def check(name: str, func):
+        nonlocal ok
+        try:
+            detail = func()
+            log('[ OK ] {}{}'.format(name, '' if detail is None else '：{}'.format(detail)))
+        except Exception as exc:                       # noqa: BLE001
+            ok = False
+            log('[FAIL] {}：{}'.format(name, exc))
+            for line in traceback.format_exc().strip().splitlines()[-3:]:
+                log('       ' + line)
+
+    def _config():
+        from core.config import Config
+        cfg = Config.load()
+        return '心电 {} 个 / 手环 {} 个 / UI 倍率 {}'.format(
+            len(cfg.ecg_names), len(cfg.bracelet_names), cfg.ui_scale)
+
+    def _data_dir():
+        import sqlite3
+        from core.config import DATA_DIR
+        probe = os.path.join(DATA_DIR, '_selftest.db')
+        con = sqlite3.connect(probe)
+        con.execute('CREATE TABLE IF NOT EXISTS t (v TEXT)')
+        con.execute("INSERT INTO t VALUES ('ok')")
+        con.commit()
+        value = con.execute('SELECT v FROM t').fetchone()[0]
+        con.close()
+        os.remove(probe)
+        return '{}（可写，sqlite {}）'.format(DATA_DIR, value)
+
+    def _qt():
+        from PyQt5.QtCore import QT_VERSION_STR
+        from PyQt5.QtWidgets import QApplication
+        os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+        app = QApplication.instance() or QApplication([])
+        name = app.platformName()
+        return 'Qt {} / 平台插件 {}'.format(QT_VERSION_STR, name)
+
+    def _models():
+        from core.config import Config
+        from vision.face_detector import MODELS_DIR, TORCH_MODEL, ONNX_MODEL
+        found = [os.path.basename(p) for p in (TORCH_MODEL, ONNX_MODEL)
+                 if os.path.exists(p)]
+        cfg = Config.load()
+        backend = (getattr(cfg, 'vision_backend', 'auto') or 'auto').lower()
+        # ort 后端只认 ONNX；torch 只认 .pt。按配置检查对应文件，别一刀切要求 .pt。
+        if backend == 'ort' and not os.path.exists(ONNX_MODEL):
+            raise FileNotFoundError('缺少 {}（运行 fetch_models.py --with-onnx）'
+                                    .format(os.path.basename(ONNX_MODEL)))
+        if not found:
+            raise FileNotFoundError('models 目录里没有任何人脸模型')
+        return '{} 里有 {}'.format(MODELS_DIR, '、'.join(found))
+
+    def _vision_config():
+        from core.config import Config
+        cfg = Config.load()
+        return '后端 {} / 设备 {} / providers {}'.format(
+            getattr(cfg, 'vision_backend', 'auto'),
+            getattr(cfg, 'vision_device', 'auto'),
+            ','.join(cfg.vision_providers()) if hasattr(cfg, 'vision_providers') else '-')
+
+    def _ort_providers():
+        import onnxruntime as ort
+        available = ort.get_available_providers()
+        return 'onnxruntime {} · 可用 {}'.format(ort.__version__, ', '.join(available))
+
+    def _face_backend():
+        import numpy as np
+        from core.config import Config
+        cfg = Config.load()
+        from vision.face_detector import build_detector
+        detector = build_detector(getattr(cfg, 'vision_face_detector', 'scrfd'),
+                                  conf=getattr(cfg, 'vision_face_conf', 0.35),
+                                  providers=cfg.vision_providers(),
+                                  gpu_fallback=bool(getattr(cfg, 'vision_gpu_fallback', True)),
+                                  backend=getattr(cfg, 'vision_backend', 'auto'))
+        faces = detector.detect(np.zeros((240, 320, 3), dtype=np.uint8))
+        return '{} · {} · 空帧检出 {} 张'.format(
+            detector.description, detector.device_label, len(faces))
+
+    def _keypoints():
+        """确认关键点能解出来，且门控四条分支都通。
+
+        不依赖真实摄像头：用构造的 FaceBox + 关键点跑门控；
+        关键点解析则看模型输出维度（row[5:20] 必须是 5 组 (置信,x,y)）。
+        """
+        from vision.face_detector import FaceBox
+        from vision.pose_gate import gate_face
+        import numpy as np
+
+        kp = np.array([[0.9, 100, 100], [0.9, 140, 100], [0.9, 120, 120],
+                       [0.88, 105, 140], [0.85, 135, 140]], dtype=float)
+        ok = gate_face(FaceBox(80, 80, 160, 160, 0.9, keypoints=kp), (480, 640))
+        low = kp.copy()
+        low[3:, 0] = 0.2
+        miss = gate_face(FaceBox(80, 80, 160, 160, 0.9, keypoints=low), (480, 640))
+        down = kp.copy()
+        down[3:, 2] = 158
+        head = gate_face(FaceBox(80, 80, 160, 160, 0.9, keypoints=down), (480, 640))
+        none = gate_face(FaceBox(80, 80, 160, 160, 0.9), (480, 640))
+        if not ok.visible or ok.source != 'mouth':
+            raise RuntimeError('正常关键点没走嘴部裁剪：{}'.format(ok))
+        if miss.visible or miss.reason != 'low_conf':
+            raise RuntimeError('低置信分支不对：{}'.format(miss))
+        if head.visible or head.reason != 'head_down':
+            raise RuntimeError('低头分支不对：{}'.format(head))
+        if not none.visible or none.reason != 'no_keypoints':
+            raise RuntimeError('无关键点应退回整脸：{}'.format(none))
+        return '四条分支通过（嘴部裁剪 {}×{}）'.format(ok.roi[2] - ok.roi[0],
+                                                     ok.roi[3] - ok.roi[1])
+
+    def _yawn_backend():
+        import numpy as np
+        from core.config import Config
+        cfg = Config.load()
+        from vision.mouth_state import MouthClassifier, DEFAULT_MODEL
+        clf = MouthClassifier(providers=cfg.vision_providers()).load()
+        prob = clf.predict(np.zeros((120, 100, 3), dtype=np.uint8))
+        return '{} · {} · 空帧概率 {:.3f}'.format(
+            os.path.basename(DEFAULT_MODEL), clf.engine, prob)
+
+    def _fusion():
+        from analysis import ppg_fusion
+        available, note = ppg_fusion.available()
+        if not available:
+            raise RuntimeError(note)
+        return note
+
+    def _ble():
+        import bleak
+        from bleak.backends.winrt.client import BleakClientWinRT  # noqa: F401
+        return 'bleak {} · winrt 后端已加载'.format(getattr(bleak, '__version__', '?'))
+
+    def _peripherals():
+        import serial
+        import pylsl
+        return 'pyserial {} / pylsl {}'.format(
+            getattr(serial, '__version__', '?'), getattr(pylsl, '__version__', '?'))
+
+    def _camera():
+        import cv2
+        count = 0
+        for index in range(3):
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+            if cap.isOpened():
+                count += 1
+            cap.release()
+        return '检测到 {} 个可用摄像头（没插相机时 0 是正常的）'.format(count)
+
+    check('配置文件', _config)
+    check('数据目录', _data_dir)
+    check('Qt 平台插件', _qt)
+    check('模型文件', _models)
+    check('视觉配置', _vision_config)
+    check('onnxruntime', _ort_providers)
+    check('人脸检测后端', _face_backend)
+    check('关键点 / 姿态门控', _keypoints)
+    check('哈欠模型后端', _yawn_backend)
+    check('四通道融合管线', _fusion)
+    check('蓝牙后端', _ble)
+    check('串口 / LSL', _peripherals)
+    check('摄像头', _camera)
+
+    log('')
+    log('结论：{}'.format('全部通过，可以现场采集' if ok else '有检查项未通过，见上面 [FAIL]'))
+    try:
+        with open(os.path.join(paths.APP_DIR, 'selftest.log'), 'w',
+                  encoding='utf-8') as handle:
+            handle.write('\n'.join(lines) + '\n')
+    except OSError:
+        pass
+    return 0 if ok else 1
 
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
+    if args.selftest:
+        return run_selftest()
     cfg = Config.load()
 
     # 命令行覆盖（只影响本次运行，不回写 config.ini）
@@ -184,7 +392,8 @@ def main(argv: Optional[list] = None) -> int:
     if args.bracelet is not None:
         overrides['bracelet_names'] = [n.strip() for n in args.bracelet.split(',') if n.strip()]
 
-    buffers = LiveBuffers()
+    # 心率单独用一条长缓冲（默认 30s）：波形曲线仍用 12s，两者互不影响
+    buffers = LiveBuffers(ecg_hr_seconds=float(getattr(cfg, 'hr_window_sec', 30.0)))
     status = DeviceStatus()
 
     # 字号倍率：必须在建 QApplication / 任何对话框之前定下来（theme.QSS 会被重建）。

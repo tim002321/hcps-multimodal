@@ -250,12 +250,26 @@ def main() -> int:
         conn = sqlite3.connect(f'file:{camera_stats["db_path"]}?mode=ro', uri=True)
         try:
             camera_rows = conn.execute('SELECT COUNT(*) FROM camera_frames').fetchone()[0]
-            sample = conn.execute('SELECT jpeg FROM camera_frames LIMIT 1').fetchone()
+            columns = {r[1] for r in conn.execute('PRAGMA table_info("camera_frames")')}
+            sample = conn.execute('SELECT jpeg%s FROM camera_frames LIMIT 1'
+                                  % (', file' if 'file' in columns else '')).fetchone()
         finally:
             conn.close()
         if sample:
             import cv2
-            image = cv2.imdecode(np.frombuffer(sample[0], dtype=np.uint8), cv2.IMREAD_COLOR)
+            # 新格式库里 jpeg 是空的、图片在 file 指向的文件夹里
+            blob = sample[0]
+            if (not blob and len(sample) > 1 and sample[1]):
+                rel = sample[1]
+                base = os.path.dirname(os.path.abspath(camera_stats['db_path']))
+                path = rel if os.path.isabs(rel) else os.path.join(base, *rel.split('/'))
+                try:
+                    with open(path, 'rb') as fh:
+                        blob = fh.read()
+                except OSError:
+                    blob = b''
+            image = (cv2.imdecode(np.frombuffer(blob, dtype=np.uint8), cv2.IMREAD_COLOR)
+                     if blob else None)
             checks.append(('入库的 JPEG 能解码', image is not None and image.shape[0] > 0,
                            str(None if image is None else image.shape)))
     checks.append(('摄像头 30fps 入库', camera_rows >= 45,

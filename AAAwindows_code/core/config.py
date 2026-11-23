@@ -26,10 +26,13 @@ import os
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-# 项目根目录：AAAwindows_code/（本文件在 core/ 下）
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CONFIG_PATH = os.path.join(PROJECT_ROOT, 'config.ini')
-DATA_DIR = os.path.join(PROJECT_ROOT, 'data')
+from core import paths
+
+# 路径统一由 core.paths 推导：源码运行 = 工程目录；打包后 = exe 所在目录。
+# 这样 config.ini / data/ 永远跟着程序走，不写死任何绝对路径。
+PROJECT_ROOT = paths.APP_DIR
+CONFIG_PATH = paths.ensure_config()
+DATA_DIR = paths.ensure_dir(paths.DATA_DIR)
 
 
 def _split_names(raw: str) -> List[str]:
@@ -83,6 +86,17 @@ class Config:
     flush_interval: float = 0.5
     data_dir: str = DATA_DIR
 
+    # ---- 摄像头 ----
+    # 帧率直接决定库里 JPEG 的体积：30→15fps 体积约减半，而哈欠检测只有 6~7Hz
+    camera_index: int = 0
+    camera_width: int = 640
+    camera_height: int = 480
+    camera_fps: float = 15.0
+    camera_quality: int = 80
+    # 图片与录像落盘开关（库里只留索引）：关掉图片就只剩 mp4，关掉录像就只剩逐帧图片
+    camera_save_frames: bool = True
+    camera_save_video: bool = True
+
     # ---- 界面 ----
     # 字号倍率：1.0 = 原始设计值。高 DPI 屏由 Qt 自动缩放，
     # 这里只在"还想再大一点"时叠加（1.15 / 1.3 比较常用）。
@@ -96,9 +110,23 @@ class Config:
     vision_yawn_min_sec: float = 1.5     # 连续张嘴多久算一次哈欠
     vision_cooldown_sec: float = 5.0     # 一次哈欠后的冷却
     vision_dip_grace: float = 0.3        # 概率瞬时跌落的容忍窗口（秒），防抖动打断判定
-    vision_backend: str = 'auto'         # auto / torch / onnx
+    vision_backend: str = 'auto'         # ort / auto / torch / onnx
+    vision_face_detector: str = 'scrfd'  # scrfd（纯 ONNX，默认）/ yolo
     vision_face_conf: float = 0.35       # 人脸检测置信度阈值
     vision_center_band: float = 0.25     # 只认画面中间的人：脸中心允许偏离中线多少（占比）
+    # ---- 姿态门控（看得见嘴才判哈欠）----
+    vision_gate: bool = True             # 关掉退回旧行为：整脸输入、不报低头
+    vision_mouth_crop: bool = False      # True=关键点裁嘴喂模型（2026-11-18 实测模型不认）
+    vision_kp_conf: float = 0.5          # 嘴角关键点置信下限
+    vision_mouth_low: float = 0.95       # 嘴角纵坐标 / 脸框高度 超过它就判低头
+    vision_device: str = 'auto'          # cuda / cpu / auto
+    vision_gpu_fallback: bool = True     # CUDA 不可用时自动退回 CPU
+
+    # ---- 实时心率 ----
+    # 窗口越长越准，代价是反应慢；12/1 是原来的行为
+    hr_window_sec: float = 30.0
+    hr_update_sec: float = 5.0
+    hr_min_beats: int = 10
 
     # ------------------------------------------------------------------
     @classmethod
@@ -138,6 +166,14 @@ class Config:
             commit_rows=cp.getint('storage', 'commit_rows', fallback=500),
             flush_interval=cp.getfloat('storage', 'flush_interval', fallback=0.5),
 
+            camera_index=cp.getint('camera', 'index', fallback=0),
+            camera_width=cp.getint('camera', 'width', fallback=640),
+            camera_height=cp.getint('camera', 'height', fallback=480),
+            camera_fps=cp.getfloat('camera', 'fps', fallback=15.0),
+            camera_quality=cp.getint('camera', 'quality', fallback=80),
+            camera_save_frames=cp.getboolean('camera', 'save_frames', fallback=True),
+            camera_save_video=cp.getboolean('camera', 'save_video', fallback=True),
+
             ui_scale=cp.getfloat('ui', 'scale', fallback=1.0),
 
             vision_enabled=cp.getboolean('vision', 'enabled', fallback=True),
@@ -147,9 +183,36 @@ class Config:
             vision_cooldown_sec=cp.getfloat('vision', 'cooldown_sec', fallback=5.0),
             vision_dip_grace=cp.getfloat('vision', 'dip_grace', fallback=0.3),
             vision_backend=get('vision', 'backend') or 'auto',
+            vision_face_detector=get('vision', 'face_detector') or 'scrfd',
             vision_face_conf=cp.getfloat('vision', 'face_conf', fallback=0.35),
             vision_center_band=cp.getfloat('vision', 'center_band', fallback=0.25),
+            vision_gate=cp.getboolean('vision', 'gate_enabled', fallback=True),
+            vision_mouth_crop=cp.getboolean('vision', 'mouth_crop', fallback=False),
+            vision_kp_conf=cp.getfloat('vision', 'kp_conf', fallback=0.5),
+            vision_mouth_low=cp.getfloat('vision', 'mouth_low_ratio', fallback=0.95),
+            vision_device=get('vision', 'device') or 'auto',
+            vision_gpu_fallback=cp.getboolean('vision', 'gpu_fallback', fallback=True),
+
+            hr_window_sec=cp.getfloat('hr', 'window_sec', fallback=30.0),
+            hr_update_sec=cp.getfloat('hr', 'update_sec', fallback=5.0),
+            hr_min_beats=cp.getint('hr', 'min_beats', fallback=10),
         )
+
+    # ------------------------------------------------------------------
+    def vision_providers(self) -> List[str]:
+        """按 device / gpu_fallback 组装 onnxruntime 的 providers。
+
+        * device=cpu            → 只用 CPU
+        * device=cuda + 允许回退 → CUDA 优先、CPU 兜底（实际用哪个由会话决定）
+        * device=cuda + 禁止回退 → 只给 CUDA，拿不到就抛错（避免"以为在用 GPU"）
+        * device=auto           → 同"允许回退"
+        """
+        device = (self.vision_device or 'auto').lower()
+        if device in ('cpu', 'none'):
+            return ['CPUExecutionProvider']
+        if device == 'cuda' and not self.vision_gpu_fallback:
+            return ['CUDAExecutionProvider']
+        return ['CUDAExecutionProvider', 'CPUExecutionProvider']
 
     # ------------------------------------------------------------------
     def at_least_one_device(self) -> bool:

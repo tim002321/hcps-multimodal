@@ -23,6 +23,8 @@ from typing import Optional
 
 import numpy as np
 
+from core.paths import resolve_resource_dir
+
 # 与 model_config.py 保持一致
 INPUT_SIZE = (100, 100)
 COLOR_CHANNELS = 1
@@ -32,9 +34,7 @@ COLOR_CHANNELS = 1
 # 真实阈值必须用 tools/vision/calibrate_threshold.py 在本地素材上标定。
 DEFAULT_THRESHOLD = 0.5
 
-DEFAULT_MODEL = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    'models', 'yawn_model_80.onnx')
+DEFAULT_MODEL = os.path.join(resolve_resource_dir('models'), 'yawn_model_80.onnx')
 
 
 class MouthClassifier:
@@ -50,10 +50,15 @@ class MouthClassifier:
         cv2         只用 cv2.dnn
         onnxruntime 只用 onnxruntime
 
-    为什么默认 cv2.dnn：两者在真实人脸框上输出**逐位相同**（实测 15 帧最大差值 0），
-    cv2.dnn 单帧 2.35ms，且不需要加载 onnxruntime 那套原生库。onnxruntime 与 torch
-    各带一份 OpenMP/protobuf，在 Windows + PyQt5 里后加载会直接段错误
-    （详见 vision/yawn_monitor.py 里 `_preload_heavy_modules` 的说明），能不用就不用。
+    注意：OpenCV ≥4.10 的 dnn 解析这个 Keras 导出的 ONNX 会失败
+    （onnx_importer 报 unsupported op）。此时 auto 会自动落到 onnxruntime，
+    实测单帧约 1ms —— 所以现在实际生效的基本都是 onnxruntime。
+    传了 CUDA/DirectML 的 providers 时直接走 onnxruntime，不再尝试 cv2。
+
+    为什么以前默认 cv2.dnn：两者在真实人脸框上输出**逐位相同**（实测 15 帧最大差值 0），
+    且不需要加载 onnxruntime 那套原生库。onnxruntime 与 torch 各带一份 OpenMP/protobuf，
+    在 Windows + PyQt5 里后加载会直接段错误（详见 vision/yawn_monitor.py 里
+    `_preload_heavy_modules` 的说明），能不用就不用。
     """
 
     def __init__(self, model_path: Optional[str] = None, threshold: float = DEFAULT_THRESHOLD,
@@ -62,6 +67,7 @@ class MouthClassifier:
         self.threshold = float(threshold)
         self.backend = backend
         self.engine = ''          # 实际生效的后端：'cv2' / 'onnxruntime'
+        self.active_provider = '' # onnxruntime 实际 provider（CUDAExecutionProvider / CPUExecutionProvider）
         self._session = None      # onnxruntime 会话
         self._net = None          # cv2.dnn 网络
         self._input_name = ''
@@ -82,16 +88,27 @@ class MouthClassifier:
         want = (self.backend or 'auto').lower()
         errors = []
 
-        if want in ('auto', 'cv2', 'opencv'):
-            try:
-                import cv2
-                self._net = cv2.dnn.readNetFromONNX(self.model_path)
-                self.engine = 'cv2'
-                return self
-            except Exception as exc:                      # noqa: BLE001 - 退到下一个后端
-                errors.append('cv2.dnn 不可用：{}'.format(exc))
+        # 指定了 CUDA/DirectML 的 provider 时，必须走 onnxruntime 才可能用上 GPU；
+        # 否则维持原来的顺序（cv2.dnn 更轻，输出与 onnxruntime 逐位相同）。
+        gpu_wanted = any(p != 'CPUExecutionProvider' for p in (self._providers or []))
+        order = ['onnxruntime', 'cv2'] if gpu_wanted else ['cv2', 'onnxruntime']
+        if want in ('cv2', 'opencv'):
+            order = ['cv2']
+        elif want in ('onnxruntime', 'onnx'):
+            order = ['onnxruntime', 'cv2']
 
-        if want in ('auto', 'onnxruntime', 'onnx'):
+        for engine in order:
+            if engine == 'cv2':
+                try:
+                    import cv2
+                    self._net = cv2.dnn.readNetFromONNX(self.model_path)
+                    self.engine = 'cv2'
+                    self.active_provider = 'CPU（cv2.dnn）'
+                    return self
+                except Exception as exc:                  # noqa: BLE001 - 退到下一个后端
+                    errors.append('cv2.dnn 不可用：{}'.format(exc))
+                continue
+
             try:
                 import onnxruntime as ort
                 options = ort.SessionOptions()
@@ -102,6 +119,8 @@ class MouthClassifier:
                 self._input_name = self._session.get_inputs()[0].name
                 self._output_name = self._session.get_outputs()[0].name
                 self.engine = 'onnxruntime'
+                active = self._session.get_providers()
+                self.active_provider = active[0] if active else 'CPUExecutionProvider'
                 return self
             except ImportError:
                 errors.append('缺少 onnxruntime（pip install onnxruntime）')

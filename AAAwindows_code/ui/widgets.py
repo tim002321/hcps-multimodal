@@ -214,7 +214,10 @@ class ChartPanel(QFrame):
         if name in self._curves:
             return
         color = color or self.COLORS[len(self._curves) % len(self.COLORS)]
-        self._curves[name] = self.plot.plot([], [], pen=pg.mkPen(color=color, width=width))
+        # connect='finite'：心电清理后伪迹段是 NaN，要在缺口处断线；
+        # 默认的 'all' 会把 NaN 连成一条横线，看起来像信号归零了
+        self._curves[name] = self.plot.plot([], [], connect='finite',
+                                            pen=pg.mkPen(color=color, width=width))
 
     def set_series(self, name: str, values: Sequence[float], sample_rate: float = 1.0,
                    color: Optional[str] = None, end_time: Optional[float] = None) -> None:

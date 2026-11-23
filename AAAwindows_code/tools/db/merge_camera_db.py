@@ -56,9 +56,20 @@ def main() -> int:
         existing = {(r[0], r[1]) for r in conn.execute(
             'SELECT time, frame_index FROM camera_frames')}
         copied = 0
-        for stamp, frame_index, jpeg in rows:
+        moved = 0
+        for stamp, frame_index, jpeg, path in rows:
             if (stamp, frame_index) in existing:
                 continue
+            if not jpeg:
+                # 新格式库里图在文件夹里：合并时读回 BLOB，保证合并后的库自包含
+                if not path:
+                    continue
+                try:
+                    with open(path, 'rb') as handle:
+                        jpeg = handle.read()
+                except OSError:
+                    continue
+                moved += 1
             conn.execute('INSERT INTO camera_frames (time, camera, frame_index, width, height, jpeg)'
                          ' VALUES (?,?,?,?,?,?)',
                          (stamp, 'usb0', frame_index, 640, 480, jpeg))
@@ -67,7 +78,8 @@ def main() -> int:
         total = conn.execute('SELECT COUNT(*) FROM camera_frames').fetchone()[0]
     finally:
         conn.close()
-    print('新增 {} 帧，合并后会话库共 {} 帧'.format(copied, total))
+    print('新增 {} 帧（其中 {} 帧从文件夹读回），合并后会话库共 {} 帧'
+          .format(copied, moved, total))
     print('[完成] 可以用 tools/replay_check.py 验证统一回放')
     return 0
 

@@ -9,27 +9,30 @@ opencv-python>=4.8
 # ---------------------------------------------------------------------------
 # 摄像头实时打哈欠检测（vision/）—— 可选，不装就不影响采集与界面
 #
-# 张嘴判定：**不需要额外装推理引擎**，直接用 opencv 自带的 cv2.dnn 跑 ONNX
-#         （实测与 onnxruntime 输出逐位相同，单帧约 2~5ms）。
+# 默认走 onnxruntime（config.ini 的 [vision] backend=ort / device=cpu）：
+#     pip install onnxruntime            # 约 15MB，CPU
+#   人脸与张嘴都用 ONNX，缺 torch 也能跑。
 #
-# 人脸检测两条路，二选一：
-#   1) 有 NVIDIA 显卡、想走 GPU：装 ultralytics（会连带装 torch）
-#        pip install ultralytics
-#      CUDA 版 torch 要单独装（约 2.3GB）：
-#        pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 ^
-#            --index-url https://download.pytorch.org/whl/cu121
-#   2) 只用 CPU：先下 models/yolov8n-face.onnx，再把 config.ini 的
-#      [vision] backend 设成 onnx，不必装 torch。
+# 想用 GPU（现场那台 NVIDIA 机器）：
+#     1) pip install onnxruntime-gpu      # 约 250MB，需 CUDA 12.x + cuDNN 9
+#        没有系统 CUDA 时可再装 pip 轮子自带 DLL（合计约 1GB）：
+#          pip install nvidia-cudnn-cu12 nvidia-cublas-cu12
+#     2) 把 config.ini 的 [vision] device 从 cpu 改成 cuda
+#     3) python run_monitor.py --selftest    # 确认「人脸检测后端」显示 GPU CUDA
+#   注意：onnxruntime-gpu 与本机已装的 onnxruntime 是同一个 import 名，
+#   必须卸载其一（pip uninstall onnxruntime 再装 -gpu）。
 #
-# 模型权重不进版本库，用脚本获取：
+# 另一条 GPU 路线（本机验证过，但包体大）：ultralytics + CUDA 版 torch
+#     pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 ^
+#         --index-url https://download.pytorch.org/whl/cu121
+#   torch 后端会自动用 CUDA（vision/face_detector.py 里 device 探测）。
+#
+# 模型权重不进版本库，用脚本获取（现在默认后端需要 ONNX）：
 #     python tools/vision/fetch_models.py --with-onnx
+#   yolov8n-face.onnx 12.7MB、yawn_model_80.onnx 9.4MB。
 #
-# 本机已验证的组合（Windows 11 / Python 3.12 / RTX 3060 Laptop 6GB）：
-#     torch 2.5.1+cu121  torchvision 0.20.1+cu121  ultralytics 8.4.193
-#     numpy 1.26.0（不要升到 2.x，pyqtgraph 旧版会不兼容）
-#
-# 注意：torch / ultralytics 会被 run_monitor.py 在导入 cv2、PyQt5 之前先加载。
-# 顺序反了会在 Windows 上段错误退出，详见 README「三个已经踩过的坑」。
+# numpy 必须 < 2（pyqtgraph 与部分旧代码不兼容）：
+#     装 onnx 等包时如果被升到 2.x，务必改回 pip install "numpy<2"
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -40,9 +43,9 @@ opencv-python>=4.8
 #   旧版串口透传手环：python devices/legacy_bracelet.py --serial COM3
 #     pip install pyserial
 #
-# 纯 CPU 降级推理：只有 [vision] backend 设成 onnx、或 cv2.dnn 加载失败时才回退到
-#   onnxruntime，默认路径不需要。
-#     pip install onnxruntime
+# 视觉推理（默认后端 ort，必需）与 GPU 说明见上面的「摄像头实时打哈欠检测」一节。
+#   纯 CPU：pip install onnxruntime
+#   要 GPU：pip install onnxruntime-gpu（先把 onnxruntime 卸掉）
 # ---------------------------------------------------------------------------
 
 # 完整清单（含全部可选依赖、import 名与 pip 包名对照）见 requirements-all.txt

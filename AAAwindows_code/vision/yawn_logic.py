@@ -24,12 +24,16 @@ STATE_NO_FACE = 'no_face'
 STATE_NORMAL = 'normal'
 STATE_OPEN = 'open'
 STATE_YAWNING = 'yawning'
+# 人脸检出了，但嘴部被遮住/拍不到（低头、侧脸、距离太远）。
+# 这个状态下不判哈欠、也不该给张口概率——硬给就是误报。
+STATE_MOUTH_HIDDEN = 'mouth_hidden'
 
 STATE_TEXT = {
     STATE_NO_FACE: '未检测到人脸',
     STATE_NORMAL: '正常',
     STATE_OPEN: '张嘴中',
     STATE_YAWNING: '打哈欠',
+    STATE_MOUTH_HIDDEN: '低头·嘴不可见',
 }
 
 FATIGUE_NORMAL = 'normal'
@@ -68,8 +72,9 @@ class YawnStatus:
     state: str = STATE_NO_FACE
     prob: float = 0.0
     open_duration: float = 0.0        # 本轮已连续张嘴的秒数
-    yawn_count: int = 0               # 本会话累计
+    yawn_count: int = 0               # 统计窗口内的次数（旧名，保留兼容）
     recent_count: int = 0             # 统计窗口内的次数
+    total_count: int = 0              # 本会话累计次数（只增不减，落库和界面用这个）
     fatigue: str = FATIGUE_NORMAL
     since_last_yawn: Optional[float] = None
 
@@ -104,10 +109,17 @@ class YawnLogic:
     _last_face_at: Optional[float] = None
     _last_seen_face: bool = False
     _prob: float = 0.0
+    total_count: int = 0                                   # 会话累计哈欠次数
 
     # ------------------------------------------------------------------
-    def update(self, t: float, prob: float, has_face: bool = True) -> YawnStatus:
-        """喂一帧的结果。`t` 是单调递增的秒数（用 time.monotonic()）。"""
+    def update(self, t: float, prob: float, has_face: bool = True,
+               mouth_visible: bool = True) -> YawnStatus:
+        """喂一帧的结果。`t` 是单调递增的秒数（用 time.monotonic()）。
+
+        `mouth_visible=False` 表示"人脸检出了，但嘴拍不到"（低头、侧脸、太远）。
+        这时必须**打断连续张嘴计时并返回 mouth_hidden**，不能当成 no_face：
+        no_face 有 1 秒容忍窗，会让状态在门控前后"粘住"，而且疲劳/计数语义也不同。
+        """
         self._prob = float(prob) if has_face else 0.0
 
         # --- 无人脸：先容忍一小段（漏检），超过阈值才真正切态 ---
@@ -123,6 +135,13 @@ class YawnLogic:
 
         self._last_face_at = t
         self._last_seen_face = True
+
+        # --- 有脸但看不见嘴：打断张嘴计时，明确报"嘴不可见"，不计哈欠 ---
+        if not mouth_visible:
+            self._open_since = None
+            self._dip_since = None
+            self._counted_this_run = False
+            return self._status(t, STATE_MOUTH_HIDDEN)
 
         # --- 张嘴判定 ---
         if self._prob >= self.threshold:
@@ -156,6 +175,7 @@ class YawnLogic:
 
     def _count_yawn(self, t: float) -> None:
         self.events.append(t)
+        self.total_count += 1
         self._last_yawn = t
         self._counted_this_run = True
         self._prune(t)
@@ -195,6 +215,7 @@ class YawnLogic:
             open_duration=round(duration, 2),
             yawn_count=len(self.events),
             recent_count=len(self.events),
+            total_count=self.total_count,
             fatigue=self._fatigue(),
             since_last_yawn=round(t - self._last_yawn, 1) if self._last_yawn is not None else None,
         )

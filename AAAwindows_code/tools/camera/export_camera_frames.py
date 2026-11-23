@@ -35,18 +35,34 @@ def main() -> int:
 
     conn = sqlite3.connect(f'file:{args.db}?mode=ro', uri=True)
     try:
+        columns = {row[1] for row in conn.execute('PRAGMA table_info("camera_frames")')}
+        # 新格式库里 jpeg 是空的，图片在 file 指向的文件夹里（相对库所在目录）
+        tail = ', file' if 'file' in columns else ''
         if args.index:
             rows = conn.execute(
-                'SELECT frame_index, time, jpeg FROM camera_frames WHERE frame_index=?',
+                f'SELECT frame_index, time, jpeg{tail} FROM camera_frames WHERE frame_index=?',
                 (args.index,)).fetchall()
         else:
             rows = conn.execute(
-                'SELECT frame_index, time, jpeg FROM camera_frames ORDER BY frame_index').fetchall()
+                f'SELECT frame_index, time, jpeg{tail} FROM camera_frames ORDER BY frame_index'
+            ).fetchall()
     finally:
         conn.close()
 
+    base = os.path.dirname(os.path.abspath(args.db))
     written = 0
-    for position, (frame_index, stamp, jpeg) in enumerate(rows):
+    for position, row in enumerate(rows):
+        frame_index, stamp, jpeg = row[0], row[1], row[2]
+        if not jpeg and len(row) > 3 and row[3]:
+            rel = row[3]
+            path = rel if os.path.isabs(rel) else os.path.join(base, *rel.split('/'))
+            try:
+                with open(path, 'rb') as handle:
+                    jpeg = handle.read()
+            except OSError:
+                continue
+        if not jpeg:
+            continue
         if args.index == 0 and position % max(1, args.every):
             continue
         if args.limit and written >= args.limit:

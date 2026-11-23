@@ -99,11 +99,25 @@ def load_frames_from_db(db_path: str, limit: int) -> List[bytes]:
             "SELECT name FROM sqlite_master WHERE type='table'")]
         if 'camera_frames' not in tables:
             raise SystemExit('这个库里没有 camera_frames 表：{}'.format(db_path))
-        rows = conn.execute(
-            'SELECT jpeg FROM camera_frames ORDER BY frame_index LIMIT ?', (limit,)).fetchall()
+        columns = {row[1] for row in conn.execute('PRAGMA table_info("camera_frames")')}
+        # 新格式库里 jpeg 是空的、图片在 file 指向的文件夹里（相对库目录）
+        sql = ('SELECT jpeg%s FROM camera_frames ORDER BY frame_index LIMIT ?'
+               % (', file' if 'file' in columns else ''))
+        rows = conn.execute(sql, (limit,)).fetchall()
     finally:
         conn.close()
-    return [row[0] for row in rows]
+    base = os.path.dirname(os.path.abspath(db_path))
+    frames = []
+    for row in rows:
+        blob = row[0]
+        if not blob and len(row) > 1 and row[1]:
+            rel = row[1]
+            path = rel if os.path.isabs(rel) else os.path.join(base, *rel.split('/'))
+            with open(path, 'rb') as handle:
+                blob = handle.read()
+        if blob:
+            frames.append(blob)
+    return frames
 
 
 def load_frames_from_dir(folder: str, limit: int) -> List[bytes]:

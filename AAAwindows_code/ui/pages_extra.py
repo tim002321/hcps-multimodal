@@ -180,8 +180,9 @@ class AnalysisPage(BasePage):
     ]
     DEFAULT_MODEL = 'physio'
 
-    # 生理指标分析覆盖的三路信号（顺序即结果表的显示顺序）
-    SECTIONS = ('心电', '手环PPG', '皮电GSR')
+    # 生理指标分析覆盖的信号（顺序即结果表的显示顺序）。
+    # 「心算」只有在会话库里带 trials 表时才出现（由 导入心算数据.py 生成）
+    SECTIONS = ('心电', '手环PPG', '皮电GSR', '视觉', '心算')
 
     def build(self) -> None:
         self.packets: List[tuple] = []
@@ -389,7 +390,9 @@ class AnalysisPage(BasePage):
         self.range_hint.setText('载入中…')
         self.packets = load_packets(path)
         if not self.packets:
-            self.range_hint.setText('该会话没有可用数据')
+            # 没有信号包也可能是纯行为会话（心算任务），照样跑一次分析
+            self.range_hint.setText('该会话没有信号数据包，按行为记录统计')
+            self.run_analysis()
             return
         first, last = self.packets[0][0], self.packets[-1][0]
         self.bound = (first, last)
@@ -415,7 +418,9 @@ class AnalysisPage(BasePage):
 
         self.packets = load_packets(path)
         if not self.packets:
-            self.range_hint.setText('该会话没有可用数据')
+            # 没有信号包也可能是纯行为会话（心算任务），照样跑一次分析
+            self.range_hint.setText('该会话没有信号数据包，按行为记录统计')
+            self.run_analysis()
             return
         first, last = self.packets[0][0], self.packets[-1][0]
         self.bound = (first, last)
@@ -443,13 +448,15 @@ class AnalysisPage(BasePage):
         if not available:
             self._show_unavailable(text, hint)
             return
-        if not self.packets:
+        if not self.packets and not self.session_combo.currentData():
+            # 还没选会话才去载入；已经选了但没信号包，直接往下算（心算这类行为数据）
             self.load_selected()
-            if not self.packets:
+            if not self.packets and not self.session_combo.currentData():
                 return
         start, end = self._selected_range()
 
-        result = analyze_packets(self.packets, start, end)
+        result = analyze_packets(self.packets, start, end,
+                                 db_path=self.session_combo.currentData())
         self.last_result = result
         rows = self._physio_rows(result)
         self._fill_rows(rows)
@@ -492,8 +499,11 @@ class AnalysisPage(BasePage):
         ppg = (result.get('手环PPG') or {}).get('特征') or {}
         gsr = (result.get('皮电GSR') or {}).get('特征') or {}
         self.tiles['hr'].set_value(str(ecg.get('bpm', '--')))
-        self.tiles['pulse'].set_value(str(ppg.get('脉率', '--')))
-        self.tiles['sdnn'].set_value(str(ecg.get('sdnn', '--')))
+        self.tiles['pulse'].set_value(
+            str(ppg.get('脉率(四通道融合)', ppg.get('脉率', '--'))))
+        # SDNN 优先取心电；心电这一路判 n/a 时用手环 PPG 的融合 SDNN 兜底，
+        # 免得心电坏了整块面板全是 "--"。
+        self.tiles['sdnn'].set_value(str(ecg.get('sdnn') or ppg.get('SDNN') or '--'))
         self.tiles['scl'].set_value(str(gsr.get('基线(SCL)', '--')))
         return rows
 

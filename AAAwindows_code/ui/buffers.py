@@ -31,9 +31,12 @@ class LiveBuffers:
     """线程安全的实时缓冲。"""
 
     def __init__(self, ecg_seconds: float = 12.0, ppg_seconds: float = 12.0,
-                 gsr_seconds: float = 60.0):
+                 gsr_seconds: float = 60.0, ecg_hr_seconds: float = 30.0):
         self.lock = threading.Lock()
+        # 波形展示用的短缓冲（12s）。心率不用这一份：30s 窗算出来的更稳，
+        # 但把 7500 点×25fps 全画到曲线上既没必要也更费力，所以单独留一条长缓冲。
         self.ecg: Deque[float] = deque(maxlen=int(ECG_RATE * ecg_seconds))
+        self.ecg_hr: Deque[float] = deque(maxlen=int(ECG_RATE * max(ecg_hr_seconds, ecg_seconds)))
         self.resp: Deque[float] = deque(maxlen=int(RESP_RATE * ecg_seconds))
         self.ecg_accel: Dict[str, Deque[float]] = {
             axis: deque(maxlen=int(ECG_ACCEL_RATE * ecg_seconds)) for axis in 'xyz'}
@@ -85,6 +88,7 @@ class LiveBuffers:
             samples = ecg.get('ECG') or []
             if samples:
                 self.ecg.extend(float(v) for v in samples)
+                self.ecg_hr.extend(float(v) for v in samples)
                 self.ecg_samples += len(samples)
             if '体温' in ecg:
                 self.last_temp = float(ecg['体温'])
@@ -145,6 +149,7 @@ class LiveBuffers:
             now = time.monotonic()
             return {
                 'ecg': self._arr(self.ecg),
+                'ecg_hr': self._arr(self.ecg_hr),
                 'resp': self._arr(self.resp),
                 'ecg_accel': {axis: self._arr(values) for axis, values in self.ecg_accel.items()},
                 'ppg': {key: self._arr(values) for key, values in self.ppg.items()},
@@ -210,6 +215,104 @@ class MonitorRecorder(DataRecorder):
             self.buffers.publish_bracelet(decoded, ts)
 
 
+def _moving_average(values: np.ndarray, window: int) -> np.ndarray:
+    """滑动平均（边缘镜像延拓），不依赖 scipy。
+
+    镜像而不是端点复制：基线漂移幅度常常是 QRS 的几倍，端点复制会让两端
+    各有一小段"基线还没跟上"的假斜坡（实测首尾 0.5 秒能偏差上千）。
+    """
+    window = int(window)
+    if window <= 1 or values.size < window:
+        return values
+    left = window // 2
+    right = window - 1 - left
+    padded = np.pad(values, (left, right), mode='reflect')
+    return np.convolve(padded, np.ones(window) / window, mode='valid')
+
+
+def _robust_baseline(values: np.ndarray, sample_rate: float,
+                     block_sec: float = 0.5, span: int = 5) -> np.ndarray:
+    """抗伪迹的慢基线：先按 0.5 秒分块取中位数，再跨块取中位数。
+
+    为什么要两步：电极"啪"一下跳几千、一秒多才回落，直接算 1 秒滑动均值会被
+    这段伪迹拖着走；分块取中位数能把块内少数坏点挡掉，跨块再取一次中位数，
+    连被伪迹污染的那一两块也能换成邻域的水平。
+    """
+    block = max(8, int(round(sample_rate * block_sec)))
+    n = values.size
+    blocks = int(np.ceil(n / block))
+    padded = np.pad(values, (0, blocks * block - n), mode='edge')
+    med = np.median(padded.reshape(blocks, block), axis=1)
+    if blocks >= span:
+        half = span // 2
+        wide = np.pad(med, (half, half), mode='edge')
+        view = np.lib.stride_tricks.sliding_window_view(wide, span)
+        med = np.median(view, axis=1)
+    centers = (np.arange(blocks) + 0.5) * block - 0.5
+    return np.interp(np.arange(n), centers, med)
+
+
+def clean_ecg_display(ecg, sample_rate: float = ECG_RATE, rail: float = 23500.0,
+                      pop: float = 1000.0, hold_sec: float = 0.3) -> np.ndarray:
+    """显示用心电清理：只影响曲线，入库的仍是原始值。
+
+    实测"看着不像心电图"只有两个原因（9 个会话库统计）：
+
+    * 直流偏移/基线漂移 ±3000，比 QRS 本身（±300）大一个量级，
+      界面自动缩放后 QRS 几乎看不见；
+    * 电极脱落：顶到 ADC 满量程，或者"啪"跳几千再慢慢回落。
+      一两个这样的点就能把 12 秒曲线压成一条直线。
+
+    做法：
+    1. 用抗伪迹的慢基线（分块中位数）算出偏离量，偏离 > pop（默认 1000，
+       QRS 相对慢基线只有三四百）或顶到轨（|x| ≥ rail）的点视为伪迹；
+    2. 短缺口（< 0.3 秒）按前后线性补平，长缺口留 NaN 让曲线断开 ——
+       不拿直线假装还有信号；
+    3. 减掉 1 秒滑动均值，压掉剩下的慢漂，NaN 段按"忽略缺失"计算。
+
+    特意**不做任何低通/滑动平均**：实测 QRS 半高宽只有 20 ms，5 点滑动平均
+    （正好是 250Hz 下 50Hz 的零点）会把双相 QRS 正负抵消掉九成，波形直接消失；
+    而 9 个库 40~60Hz 能量只占 0.2%，本来就没有工频干扰要滤。
+
+    幅度与极性都不改，界面上读到的 ADC 值仍是原始值。
+    """
+    x = np.asarray(ecg, dtype=float) if ecg is not None else np.array([])
+    if x.size < 16:
+        return x
+
+    slow = _robust_baseline(x, sample_rate)
+    bad = (np.abs(x) >= rail) | (np.abs(x - slow) > pop)
+
+    if bad.any():
+        if bad.mean() > 0.5:
+            return np.full_like(x, np.nan)            # 大半都是伪迹：整段断开
+        edges = np.diff(np.concatenate(([0], bad.astype(np.int8), [0])))
+        starts = np.flatnonzero(edges == 1)
+        ends = np.flatnonzero(edges == -1)
+        x = x.copy()
+        limit = max(2, int(round(sample_rate * hold_sec)))
+        n = len(x)
+        for start, end in zip(starts, ends):
+            if end - start > limit:
+                x[start:end] = np.nan
+            elif start > 0 and end < n:
+                x[start:end] = np.linspace(x[start - 1], x[end], end - start + 2)[1:-1]
+            else:                                    # 贴着头尾的短段：直接平推
+                hold = x[end] if start == 0 and end < n else x[max(0, start - 1)]
+                x[start:end] = hold
+
+    window = max(5, int(round(sample_rate * 1.0)))
+    if np.isnan(x).any():
+        filled = np.where(np.isnan(x), 0.0, x)
+        mask = np.where(np.isnan(x), 0.0, 1.0)
+        base = (_moving_average(filled, window)
+                / np.maximum(_moving_average(mask, window), 1e-6))
+        base[np.isnan(x)] = np.nan
+    else:
+        base = _moving_average(x, window)
+    return x - base
+
+
 def ecg_signal_quality(ecg: np.ndarray, sample_rate: float = ECG_RATE):
     """判心电信号质量，返回 (状态, 说明)。
 
@@ -228,8 +331,13 @@ def ecg_signal_quality(ecg: np.ndarray, sample_rate: float = ECG_RATE):
     return 'ok', '信号正常'
 
 
-def estimate_heart_rate(ecg: np.ndarray, sample_rate: float = ECG_RATE) -> Optional[float]:
-    """从最近一段心电估心率；信号不可用时返回 None（界面显示 --）。"""
+def estimate_heart_rate(ecg: np.ndarray, sample_rate: float = ECG_RATE,
+                        min_beats: int = 10) -> Optional[float]:
+    """从最近一段心电估心率；信号不可用时返回 None（界面显示 --）。
+
+    `min_beats`：至少要有这么多个 R 峰才出值。30 秒窗里通常是 30~50 个，
+    少于 10 个说明这段信号不能代表当前心率（刚接上电极、大量伪影）。
+    """
     quality, _text = ecg_signal_quality(ecg, sample_rate)
     if quality != 'ok':
         return None
@@ -242,7 +350,12 @@ def estimate_heart_rate(ecg: np.ndarray, sample_rate: float = ECG_RATE) -> Optio
     slow = max(fast + 2, int(0.08 * sample_rate))
     kernel_fast = np.ones(fast) / fast
     kernel_slow = np.ones(slow) / slow
-    y = np.convolve(x, kernel_fast, mode='same') - np.convolve(x, kernel_slow, mode='same')
+    # 边缘延拓后再卷积：零填充会把窗口首尾几十个点压向 0，造出一对假尖峰，
+    # 30 秒窗每 5 秒滑一次，这对假峰有几率被当成 R 波（离线版 features.py 同样处理）。
+    pad = max(fast, slow)
+    padded = np.pad(x, pad, mode='edge')
+    y = (np.convolve(padded, kernel_fast, mode='same')
+         - np.convolve(padded, kernel_slow, mode='same'))[pad:pad + len(x)]
 
     amplitude = np.percentile(np.abs(y), 99)
     if amplitude < 5:
@@ -255,7 +368,7 @@ def estimate_heart_rate(ecg: np.ndarray, sample_rate: float = ECG_RATE) -> Optio
         if y[i] > threshold and y[i] >= y[i - 1] and y[i] >= y[i + 1] and i - last > refractory:
             peaks.append(i)
             last = i
-    if len(peaks) < 3:
+    if len(peaks) < max(3, int(min_beats)):
         return None
     rr = np.diff(peaks) / sample_rate
     if len(rr) >= 2 and np.std(rr) / max(np.mean(rr), 1e-6) > 0.35:

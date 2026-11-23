@@ -29,7 +29,8 @@ from core.device_status import STATE_TEXT, DeviceStatus
 from devices.camera_receiver import CameraService
 from ui import theme
 from ui.base import BasePage, CHART_COLORS, ChannelGridPage, ac_couple
-from ui.buffers import (ECG_ACCEL_RATE, ECG_RATE, RESP_RATE, LiveBuffers, ecg_signal_quality,
+from ui.buffers import (ECG_ACCEL_RATE, ECG_RATE, RESP_RATE, LiveBuffers, clean_ecg_display,
+                        ecg_signal_quality,
                         estimate_heart_rate, estimate_resp_rate, resp_has_signal)
 from ui.pages_extra import AnalysisPage, EmgPage, EyePage, RecognizePage
 from ui.profile import DATA_DEVICES
@@ -276,7 +277,10 @@ class EcgPage(ChannelGridPage):
 
     def channel_data(self, snapshot: Dict[str, Any]):
         fs_ecg, fs_resp, fs_accel = self._rates(snapshot)
-        ecg = snapshot['ecg']
+        raw_ecg = snapshot['ecg']
+        # 曲线画清理后的（去饱和竖线、去 50Hz、去基线漂移），数字仍读原始值，
+        # 免得"ADC"这一栏显示的是一串处理过的数
+        ecg = clean_ecg_display(raw_ecg, fs_ecg)
         accel = snapshot['ecg_accel']
         temp = snapshot['temp']
 
@@ -286,7 +290,7 @@ class EcgPage(ChannelGridPage):
             return f'{values[-1]:.{digits}f}'
 
         return {
-            'ecg': (ecg, fs_ecg, last(ecg)),
+            'ecg': (ecg, fs_ecg, last(raw_ecg)),
             'resp': (snapshot['resp'], fs_resp, last(snapshot['resp'], 1)),
             'accx': (accel['x'], fs_accel, last(accel['x'], 2)),
             'accy': (accel['y'], fs_accel, last(accel['y'], 2)),
@@ -322,7 +326,7 @@ class EcgPage(ChannelGridPage):
             f'border-radius: 2px; padding: 3px 10px; font-size: {theme.pt(theme.FS_SMALL)};'
             f'background-color: #F7F7F7; border: 1px solid {color}; color: {color};')
 
-        bpm = estimate_heart_rate(ecg, fs_ecg)
+        bpm = self._heart_rate(snapshot, fs_ecg, quality_text)
         # 有数就不挂方法论说明，没数才显示信号状态
         self.tile_hr.set_value(f'{bpm:.0f}' if bpm else '--',
                                note='' if bpm else quality_text)
@@ -337,9 +341,47 @@ class EcgPage(ChannelGridPage):
             self.tile_resp.set_value('--', note='无呼吸数据')
         age = snapshot['ages'].get('ecg')
         state = '未连接' if age is None else ('接收中' if age < 3 else f'{age:.0f} 秒无数据')
+        cfg = getattr(self.window_ref, 'cfg', None)
+        hr_win = int(getattr(cfg, 'hr_window_sec', 30) or 30)
+        hr_upd = int(getattr(cfg, 'hr_update_sec', 5) or 5)
         self.info_label.setText(
             f'状态 {state} · 心电包 {counters["ecg_packets"]} · 采样点 '
-            f'{counters["ecg_samples"]}')
+            f'{counters["ecg_samples"]} · 心率 {hr_win}s 窗 / {hr_upd}s 出值')
+
+    def _heart_rate(self, snapshot: Dict[str, Any], fs_ecg: float,
+                    quality_text: str) -> Optional[float]:
+        """按 [hr] 配置出心率：长窗统计、低频出值。
+
+        窗口取 `LiveBuffers.ecg_hr`（默认 30s），与曲线用的 12s 缓冲分开：
+        窗口越长 R 峰越多、中位 RR 越稳，代价是负荷突变后要等十几秒才反映出来 ——
+        这是为了准确刻意换的。
+        两次计算之间沿用上一次的值，避免数字每秒乱跳；连续算不出来超过两个
+        刷新周期才清空显示 `--`。
+        """
+        cfg = getattr(self.window_ref, 'cfg', None)
+        update_sec = float(getattr(cfg, 'hr_update_sec', 5.0) or 5.0)
+        min_beats = int(getattr(cfg, 'hr_min_beats', 10) or 10)
+
+        now = time.monotonic()
+        cached = getattr(self, '_hr_cache', None)
+        if getattr(self, '_hr_at', 0.0) and (now - self._hr_at) < update_sec:
+            return cached
+
+        series = snapshot.get('ecg_hr')
+        if series is None or len(series) == 0:          # 兼容旧缓冲（没有 ecg_hr 的调用方）
+            series = snapshot['ecg']
+        bpm = estimate_heart_rate(np.asarray(series), fs_ecg, min_beats=min_beats)
+
+        if bpm is not None:
+            self._hr_cache = bpm
+            self._hr_missing_since = None
+        else:
+            if getattr(self, '_hr_missing_since', None) is None:
+                self._hr_missing_since = now
+            if now - self._hr_missing_since > update_sec * 2:
+                self._hr_cache = None
+        self._hr_at = now
+        return getattr(self, '_hr_cache', None)
 
 
 class BraceletPage(ChannelGridPage):
@@ -1080,9 +1122,9 @@ class PlaybackPage(BasePage):
         for key, panel in self._charts.items():
             try:
                 if key == 'ecg':
-                    ecg = snapshot['ecg']
+                    ecg = clean_ecg_display(snapshot['ecg'], fs_ecg)
                     panel.set_series('ECG', ecg, fs_ecg, end_time=end_ecg)
-                    panel.set_value(self._fmt_latest(ecg, 0))
+                    panel.set_value(self._fmt_latest(snapshot['ecg'], 0))
                 elif key == 'resp':
                     resp = snapshot['resp']
                     panel.set_series('RESP', resp, RESP_RATE, end_time=end_ecg)
@@ -1252,7 +1294,7 @@ class PlaybackPage(BasePage):
 
 
 class CameraPage(BasePage):
-    """USB 摄像头：实时预览 + 30fps 截帧入库。"""
+    """USB 摄像头：实时预览 + 按配置帧率（默认 15fps）截帧入库。"""
 
     title = '摄像头'
     subtitle = ''
@@ -1296,10 +1338,11 @@ class CameraPage(BasePage):
             return layout
 
         row = field_row('设备号')
+        cam_cfg = getattr(self.window_ref, 'cfg', None)
         self.device_spin = QDoubleSpinBox()
         self.device_spin.setDecimals(0)
         self.device_spin.setRange(0, 9)
-        self.device_spin.setValue(0)
+        self.device_spin.setValue(float(getattr(cam_cfg, 'camera_index', 0) or 0))
         self.device_spin.setFixedWidth(70)
         row.addWidget(self.device_spin)
         row.addStretch(1)
@@ -1307,17 +1350,22 @@ class CameraPage(BasePage):
 
         row2 = field_row('分辨率')
         self.size_combo = QComboBox()
-        for text, (w, h) in (('640×480', (640, 480)), ('1280×720', (1280, 720)),
-                             ('1920×1080', (1920, 1080))):
+        sizes = (('640×480', (640, 480)), ('1280×720', (1280, 720)),
+                 ('1920×1080', (1920, 1080)))
+        for text, (w, h) in sizes:
             self.size_combo.addItem(text, (w, h))
-        self.size_combo.setCurrentIndex(1)
+        want = (int(getattr(cam_cfg, 'camera_width', 640) or 640),
+                int(getattr(cam_cfg, 'camera_height', 480) or 480))
+        index = next((i for i, (_t, size) in enumerate(sizes) if size == want), 0)
+        self.size_combo.setCurrentIndex(index)
         row2.addWidget(self.size_combo, 1)
         settings.add_layout(row2)
 
         row3 = field_row('目标帧率')
         self.fps_spin = QDoubleSpinBox()
         self.fps_spin.setRange(1.0, 60.0)
-        self.fps_spin.setValue(30.0)
+        # 默认 15fps：哈欠检测只有 6~7Hz，帧率主要影响库里 JPEG 的体积
+        self.fps_spin.setValue(float(getattr(cam_cfg, 'camera_fps', 15.0) or 15.0))
         self.fps_spin.setFixedWidth(80)
         row3.addWidget(self.fps_spin)
         row3.addWidget(label('fps', 'Dim'))
@@ -1327,7 +1375,7 @@ class CameraPage(BasePage):
         row4 = field_row('JPEG 质量')
         self.quality_spin = QDoubleSpinBox()
         self.quality_spin.setRange(30, 100)
-        self.quality_spin.setValue(80)
+        self.quality_spin.setValue(float(getattr(cam_cfg, 'camera_quality', 80) or 80))
         self.quality_spin.setFixedWidth(80)
         row4.addWidget(self.quality_spin)
         row4.addStretch(1)
@@ -1397,7 +1445,8 @@ class CameraPage(BasePage):
             self.status_pill.setText('启动失败')
             self.db_label.setText(str(exc))
             return
-        self.db_label.setText('库：' + db_path)
+        self.db_label.setText('索引库：{}\n图片：{}'.format(db_path,
+                                                       self.camera_service.frames_dir))
         self.start_button.setText('停止采集')
         self.start_button.setObjectName('Danger')
         self.start_button.setStyle(self.start_button.style())
@@ -1466,6 +1515,14 @@ class CameraPage(BasePage):
         threshold = snapshot.threshold or 0.5
         for face in snapshot.faces:
             x1, y1, x2, y2, prob = face
+            if prob < 0:
+                # -1 = 有脸但嘴拍不到（低头/侧脸/太远）。不打印负概率，
+                # 用橙色框 + HIDDEN 标明"这一帧没有判据"。英文避免 cv2 中文乱码。
+                color = (0, 165, 255)                                    # BGR 橙
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(frame, 'HIDDEN', (x1 + 4, max(14, y1 - 6)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2, cv2.LINE_AA)
+                continue
             color = (0, 0, 235) if prob >= threshold else (0, 200, 80)   # BGR
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             # 概率是纯数字，用 cv2 画不会遇到中文乱码；状态文案由指标块显示
@@ -1478,9 +1535,16 @@ class CameraPage(BasePage):
         if service is None:
             return
         stats = service.stats()
-        self.db_label.setText('库：' + stats['db_path'])
+        # 图片和视频已经从库里挪到文件夹，这里三行都写清楚，方便现场直接去看
+        lines = ['索引库：' + stats['db_path']]
+        if stats.get('frames_dir'):
+            lines.append('图片：{}（{} 张）'.format(stats['frames_dir'], stats.get('files', 0)))
+        if stats.get('video_path'):
+            lines.append('录像：' + stats['video_path'])
+        self.db_label.setText('\n'.join(lines))
         self.tile_frames.set_value(str(stats['written']))
-        self.tile_size.set_value(f'{stats["db_size"] / 1024 / 1024:.1f}')
+        # 体积按「索引库 + 图片目录 + 录像」合计，单看库文件会是 0.0 MB
+        self.tile_size.set_value(f'{stats["total_bytes"] / 1024 / 1024:.1f}')
         if stats.get('error'):
             self.status_pill.setText(stats['error'])
         elif service.running:
@@ -1506,6 +1570,8 @@ class CameraPage(BasePage):
             'normal': theme.PALETTE['green'],
             'open': theme.PALETTE['amber'],
             'yawning': theme.PALETTE['red'],
+            # 低头：人还在、但嘴拍不到，用橙色区别于"未检测到人脸"的灰
+            'mouth_hidden': theme.PALETTE['amber'],
         }
         fatigue_colors = {
             'normal': theme.PALETTE['green'],
@@ -1535,8 +1601,18 @@ class CameraPage(BasePage):
         self.tile_yawn.set_value(str(snapshot.yawn_count),
                                  accent=fatigue_colors.get(snapshot.fatigue,
                                                            theme.PALETTE['red']))
-        detail = '{} · 张口 {:.2f} · {:.1f}fps · {:.0f}ms'.format(
-            snapshot.backend or '推理中', snapshot.prob, snapshot.fps, snapshot.latency_ms)
+        if snapshot.state == 'mouth_hidden':
+            # 这一帧没有张口概率，别显示 -1.00 / 0.00 误导人
+            detail = '{} · 嘴不可见 · {:.1f}fps · {:.0f}ms'.format(
+                snapshot.backend or '推理中', snapshot.fps, snapshot.latency_ms)
+            if snapshot.gate_reason and snapshot.gate_reason != 'low_conf':
+                detail += ' · {}'.format(snapshot.gate_reason)
+        else:
+            detail = '{} · 张口 {:.2f} · {:.1f}fps · {:.0f}ms'.format(
+                snapshot.backend or '推理中', snapshot.prob, snapshot.fps,
+                snapshot.latency_ms)
+        if snapshot.hidden_ratio >= 0.01:
+            detail += ' · 本秒低头 {:.0f}%'.format(snapshot.hidden_ratio * 100)
         if snapshot.state == 'no_face':
             detail += ' · 未检测到人脸'
         self.yawn_hint.setText(detail)
@@ -1946,7 +2022,18 @@ class MonitorWindow(QMainWindow):
 
     # ------------------------------------------------------------- 摄像头
     def default_camera_config(self) -> Dict[str, Any]:
-        return {'index': 0, 'width': 640, 'height': 480, 'fps': 30.0, 'quality': 80,
+        """摄像头默认参数，全部来自 config.ini 的 [camera] 节。
+
+        默认 15fps 而不是 30fps：哈欠检测本身只有 6~7Hz，帧率翻倍只会让
+        会话库里的 JPEG 翻倍（一场 100 分钟从 4 GB 涨到 8 GB）。
+        """
+        return {'index': int(getattr(self.cfg, 'camera_index', 0)),
+                'width': int(getattr(self.cfg, 'camera_width', 640)),
+                'height': int(getattr(self.cfg, 'camera_height', 480)),
+                'fps': float(getattr(self.cfg, 'camera_fps', 15.0)),
+                'quality': int(getattr(self.cfg, 'camera_quality', 80)),
+                'save_frames': bool(getattr(self.cfg, 'camera_save_frames', True)),
+                'save_video': bool(getattr(self.cfg, 'camera_save_video', True)),
                 'backend': 'dshow', 'camera': 'usb0'}
 
     def start_camera(self, config: Optional[Dict[str, Any]] = None) -> str:
@@ -1977,13 +2064,17 @@ class MonitorWindow(QMainWindow):
             self.camera_service = None
 
     # ------------------------------------------------------------- 打哈欠检测
+    def _storage(self):
+        """当前会话的 SensorDB（没连会话库时返回 None）。"""
+        return getattr(getattr(self.writer, 'recorder', None), 'storage', None)
+
     def _write_yawn_event(self, event: Dict[str, Any]) -> None:
         """把一次哈欠写进当前会话库，供事后分析用。
 
         走 SensorWriter 队列：推理线程只管判定，数据库写入由单线程串行执行，
         不会因为 SQLite 提交把推理卡住，也不会和其它采集写入抢锁。
         """
-        storage = getattr(getattr(self.writer, 'recorder', None), 'storage', None)
+        storage = self._storage()
         if storage is None:
             return
         payload = json.dumps(event, ensure_ascii=False)
@@ -1992,6 +2083,24 @@ class MonitorWindow(QMainWindow):
         try:
             self.writer.submit(lambda: storage.insert('yawn_events', payload, stamp))
         except Exception:                             # noqa: BLE001 - 写不进去也不能影响检测
+            pass
+
+    def _write_vision_frame(self, record: Dict[str, Any]) -> None:
+        """把每秒一条的视觉汇总写进 vision_frames 表。
+
+        存的是每秒聚合值而不是逐帧：一小时 3600 行、约 1 MB，
+        但足以还原"什么时候有脸、嘴张多大、判到哪一档疲劳"。
+        逐帧的原始判定在库里没有意义（帧本身就在 camera_frames）。
+        """
+        storage = self._storage()
+        if storage is None:
+            return
+        payload = json.dumps(record, ensure_ascii=False)
+        stamp = datetime.fromtimestamp(float(record['time'])).strftime(
+            '%Y-%m-%d %H:%M:%S.%f')
+        try:
+            self.writer.submit(lambda: storage.insert('vision_frames', payload, stamp))
+        except Exception:                             # noqa: BLE001
             pass
 
     def start_yawn_monitor(self) -> bool:
@@ -2011,6 +2120,14 @@ class MonitorWindow(QMainWindow):
 
         self.yawn_state = self.yawn_state or YawnState()
         self.yawn_state.reset()
+        # providers 由 [vision] device 决定：device=cpu 就只给 CPU，
+        # 换成 cuda 时装了 CUDA 运行时的机器会自动走 GPU，代码不用改。
+        providers = None
+        if cfg is not None and hasattr(cfg, 'vision_providers'):
+            try:
+                providers = cfg.vision_providers()
+            except Exception:                             # noqa: BLE001
+                providers = None
         monitor = YawnMonitor(
             self.camera_service,
             self.yawn_state,
@@ -2020,9 +2137,17 @@ class MonitorWindow(QMainWindow):
             cooldown_sec=getattr(cfg, 'vision_cooldown_sec', 5.0),
             dip_grace_sec=getattr(cfg, 'vision_dip_grace', 0.3),
             face_backend=getattr(cfg, 'vision_backend', 'auto'),
+            face_detector=getattr(cfg, 'vision_face_detector', 'scrfd'),
             face_conf=getattr(cfg, 'vision_face_conf', 0.35),
             center_band=getattr(cfg, 'vision_center_band', 0.25),
+            gate_enabled=getattr(cfg, 'vision_gate', True),
+            kp_conf=getattr(cfg, 'vision_kp_conf', 0.5),
+            mouth_low_ratio=getattr(cfg, 'vision_mouth_low', 0.95),
+            mouth_crop=bool(getattr(cfg, 'vision_mouth_crop', False)),
+            providers=providers,
+            gpu_fallback=bool(getattr(cfg, 'vision_gpu_fallback', True)),
             on_event=self._write_yawn_event,
+            on_frame=self._write_vision_frame,
         )
         self.yawn_monitor = monitor
         monitor.start()

@@ -15,6 +15,9 @@
 """
 from __future__ import annotations
 
+import json
+import os
+import sqlite3
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -374,6 +377,212 @@ def extract_eda(gsr: Sequence[float], fs: float,
 
 
 # ---------------------------------------------------------------------------
+# 心算任务（行为数据，来自 `导入心算数据.py` 生成的 trials 表）
+# ---------------------------------------------------------------------------
+
+def extract_mental_math(db_path: Optional[str]
+                        ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """从会话库的心算表算答题指标。
+
+    支持两种库：
+      * 云端导出的：`sessions`（一次会话一行）+ `trials`（逐题）→ 组级汇总
+      * 本地单机导入的：`runs` + `trials` → 本机这几次的汇总
+    没有相关表就返回 None，让上层保持 n/a。
+    """
+    if not db_path or not os.path.exists(db_path):
+        return None, '没有心算任务记录'
+    try:
+        con = sqlite3.connect(
+            'file:{}?mode=ro'.format(db_path.replace('\\', '/')), uri=True)
+    except sqlite3.Error as exc:
+        return None, '打开会话库失败：{}'.format(exc)
+
+    try:
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'trials' not in tables and 'sessions' not in tables:
+            return None, '该会话没有心算任务记录'
+
+        has_sessions = 'sessions' in tables
+        has_trials = 'trials' in tables
+        features: Dict[str, Any] = {}
+        span = 0.0
+
+        if has_sessions:
+            row = con.execute(
+                'SELECT COUNT(*), COUNT(DISTINCT subject), '
+                '       COALESCE(AVG(accuracy), 0), COALESCE(AVG(lapse_rate), 0), '
+                '       COALESCE(AVG(n_trials), 0), COALESCE(AVG(rt_change_pct), 0), '
+                '       COALESCE(SUM(duration_min), 0) FROM sessions').fetchone()
+            n_sessions, n_subjects, avg_acc, avg_lapse, avg_trials, avg_change, minutes = row
+            if not n_sessions:
+                return None, '心算任务没有会话记录'
+            features.update({
+                '会话数': int(n_sessions),
+                '被试数': int(n_subjects),
+                '平均正确率(%)': round(100.0 * float(avg_acc or 0), 1),
+                '单次平均题数': round(float(avg_trials or 0), 1),
+                '平均lapse率(%)': round(100.0 * float(avg_lapse or 0), 1),
+                '平均RT变化(%)': round(float(avg_change or 0), 1),
+            })
+            span = float(minutes or 0) * 60.0
+        elif 'runs' in tables:
+            runs = con.execute('SELECT COUNT(*) FROM runs').fetchone()[0]
+            if runs:
+                features['运行次数'] = int(runs)
+
+        if has_trials:
+            # 云端库用 session_id，本地导入的老库用 run_id
+            trial_cols = {r[1] for r in con.execute('PRAGMA table_info(trials)')}
+            group_col = 'session_id' if 'session_id' in trial_cols else 'run_id'
+            total = con.execute('SELECT COUNT(*) FROM trials').fetchone()[0]
+            if not total:
+                return None, '心算任务没有作答记录'
+            correct = con.execute('SELECT COALESCE(SUM(correct), 0) FROM trials').fetchone()[0]
+            miss = con.execute('SELECT COALESCE(SUM(miss), 0) FROM trials').fetchone()[0]
+            # 按作答先后取，漂移指标要的是时序
+            rts = [r[0] for r in con.execute(
+                'SELECT rt_ms FROM trials WHERE rt_ms IS NOT NULL AND miss = 0 '
+                'ORDER BY {}, trial'.format(group_col))]
+            if not has_sessions:
+                span = con.execute(
+                    'SELECT COALESCE(SUM(mx), 0) FROM '
+                    '(SELECT MAX(elapsed_s) AS mx FROM trials GROUP BY {})'.format(group_col)
+                ).fetchone()[0] or 0.0
+
+            # 有 sessions 表时，上面已经给了「平均正确率」（每次会话先算再平均），
+            # 这里的按题汇总换个名字，避免两个「正确率」看起来打架
+            acc_key = '正确率(按题,%)' if has_sessions else '正确率(%)'
+            features.update({
+                '答题数': int(total),
+                '正确数': int(correct),
+                '漏答数': int(miss),
+                acc_key: round(100.0 * correct / total, 1),
+            })
+            if rts:
+                ordered = rts
+                ordered_sorted = sorted(rts)
+                features['平均反应时(ms)'] = round(
+                    sum(ordered_sorted) / len(ordered_sorted), 1)
+                features['中位反应时(ms)'] = round(
+                    ordered_sorted[len(ordered_sorted) // 2], 1)
+                if len(ordered) >= 6:
+                    third = max(1, len(ordered) // 3)
+                    features['反应时漂移(ms)'] = round(
+                        sum(ordered[-third:]) / third - sum(ordered[:third]) / third, 1)
+    except sqlite3.Error as exc:
+        con.close()
+        return None, '读取心算记录失败：{}'.format(exc)
+    con.close()
+
+    features['_span_sec'] = float(span or 0.0)
+    note = '来自心算任务记录（{} 次会话 / {} 道题）'.format(
+        features.get('会话数') or features.get('运行次数') or 1,
+        features.get('答题数', 0))
+    return features, note
+
+
+# ---------------------------------------------------------------------------
+# 视觉 / 疲劳（来自实时检测写入的 vision_frames + yawn_events）
+# ---------------------------------------------------------------------------
+
+FATIGUE_TEXT = {'normal': '正常', 'mild': '轻度', 'severe': '重度'}
+STATE_TEXT = {'normal': '闭嘴', 'open': '张嘴', 'yawning': '哈欠', 'no_face': '无人脸'}
+
+
+def extract_vision(db_path: Optional[str], start: Optional[float] = None,
+                   end: Optional[float] = None
+                   ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """从会话库的逐秒视觉汇总算疲劳相关指标。
+
+    表不存在（旧版本录的、录制时没开检测）返回 None —— 调用方要显示"没有记录"，
+    不要当成"0 次哈欠"。
+    """
+    if not db_path or not os.path.exists(db_path):
+        return None, '没有视觉检测记录'
+    try:
+        con = sqlite3.connect(
+            'file:{}?mode=ro'.format(db_path.replace('\\', '/')), uri=True)
+    except sqlite3.Error as exc:
+        return None, '打开会话库失败：{}'.format(exc)
+
+    try:
+        tables = {row[0] for row in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if 'vision_frames' not in tables:
+            return None, '该会话没有视觉检测记录（录制时未启用或旧版本录制）'
+
+        where, params = '', ()
+        if start is not None and end is not None:
+            from datetime import datetime as _dt
+            where = ' WHERE time >= ? AND time <= ?'
+            params = (_dt.fromtimestamp(start).strftime('%Y-%m-%d %H:%M:%S.%f'),
+                      _dt.fromtimestamp(end).strftime('%Y-%m-%d %H:%M:%S.%f'))
+        rows = con.execute('SELECT value FROM vision_frames' + where, params).fetchall()
+
+        yawn_rows = []
+        if 'yawn_events' in tables:
+            yawn_rows = con.execute('SELECT value FROM yawn_events' + where, params).fetchall()
+    except sqlite3.Error as exc:
+        con.close()
+        return None, '读取视觉记录失败：{}'.format(exc)
+    con.close()
+
+    if not rows:
+        return None, '该区间没有视觉记录'
+
+    face_ratios, probs, fatigues, states = [], [], {}, {}
+    visible_probs = []          # 只收「嘴拍到了」的那些秒
+    hidden_sec = 0              # 嘴不可见的秒数
+    has_gate_field = False      # 旧库没有这些字段，别把缺失当成"全都不可见"
+    for (value,) in rows:
+        try:
+            d = json.loads(value) if isinstance(value, str) else dict(value)
+        except (TypeError, ValueError):
+            continue
+        face_ratios.append(float(d.get('face_ratio') or 0.0))
+        probs.append(float(d.get('prob_mean') or 0.0))
+        if 'mouth_visible' in d or 'hidden_ratio' in d:
+            has_gate_field = True
+        if d.get('state') == 'mouth_hidden' or (
+                d.get('mouth_visible') is False and d.get('has_face')):
+            hidden_sec += 1
+        else:
+            visible_probs.append(float(d.get('prob_mean') or 0.0))
+        fatigues[d.get('fatigue', 'normal')] = fatigues.get(d.get('fatigue', 'normal'), 0) + 1
+        states[d.get('state', 'no_face')] = states.get(d.get('state', 'no_face'), 0) + 1
+    if not face_ratios:
+        return None, '视觉记录无法解析'
+
+    span = float(len(face_ratios))                      # 每秒一条，条数≈秒数
+    yawn_count = len(yawn_rows)
+    dominant_fatigue = max(fatigues, key=fatigues.get) if fatigues else 'normal'
+    # 概率只在「嘴可见」的秒上统计：隐藏段的 0 会把均值压低，看着像"从不张嘴"
+    base_probs = visible_probs if visible_probs else probs
+    face_sec = sum(1 for r in face_ratios if r > 0.01) or 1
+    features: Dict[str, Any] = {
+        '检测时长(s)': round(span, 0),
+        '有脸占比(%)': round(100.0 * sum(face_ratios) / len(face_ratios), 1),
+        '张口概率均值': round(sum(base_probs) / len(base_probs), 3),
+        '张口概率峰值': round(max(base_probs), 3),
+        '哈欠次数': int(yawn_count),
+        '哈欠频次(次/分)': round(yawn_count * 60.0 / span, 2) if span > 10 else None,
+        '疲劳档位': FATIGUE_TEXT.get(dominant_fatigue, dominant_fatigue),
+        '重度疲劳占比(%)': round(100.0 * fatigues.get('severe', 0) / len(rows), 1),
+        '无人脸占比(%)': round(100.0 * states.get('no_face', 0) / len(rows), 1),
+    }
+    if has_gate_field:
+        features['嘴可见率(%)'] = round(100.0 * (1.0 - hidden_sec / float(face_sec)), 1)
+        features['低头占比(%)'] = round(100.0 * hidden_sec / float(face_sec), 1)
+    else:
+        features['嘴可见率(%)'] = None          # 旧库没记录，明确标成缺失
+        features['低头占比(%)'] = None
+    features = {k: v for k, v in features.items() if v is not None}
+    note = '来自实时视觉检测（{} 秒记录 / {} 次哈欠）'.format(int(span), yawn_count)
+    return features, note
+
+
+# ---------------------------------------------------------------------------
 # 统一的 block 结构
 # ---------------------------------------------------------------------------
 
@@ -394,11 +603,14 @@ def _block(ok: bool, note: str, features: Optional[Dict[str, Any]] = None,
 
 
 def analyze_packets(packets, start: Optional[float] = None,
-                    end: Optional[float] = None) -> Dict[str, Any]:
+                    end: Optional[float] = None,
+                    db_path: Optional[str] = None) -> Dict[str, Any]:
     """对一段会话数据做特征提取。
 
     参数 `packets` 是 `ui.replay.load_packets()` 的返回值；`start/end` 为 epoch 秒，
-    不传则用全部数据。返回结构供界面直接渲染：
+    不传则用全部数据。`db_path` 传了会话库路径时，手环 PPG 走四通道融合管线
+    （`analysis.ppg_fusion`，复用工作区的 ppg_pipeline）；不传或管线不可用时
+    退回原来的单通道轻量算法。返回结构供界面直接渲染：
 
         {
           '区间': (start, end, 时长秒),
@@ -410,12 +622,23 @@ def analyze_packets(packets, start: Optional[float] = None,
         }
     """
     if not packets:
-        return {'区间': (0, 0, 0),
-                '心电': _block(False, '没有数据'),
-                '手环PPG': _block(False, '没有数据'),
-                '皮电GSR': _block(False, '没有数据'),
-                '眼动': _block(False, '眼动仪未接入'),
-                '表情': _block(False, '表情模型未接入')}
+        result = {'区间': (0, 0, 0),
+                  '心电': _block(False, '没有数据'),
+                  '手环PPG': _block(False, '没有数据'),
+                  '皮电GSR': _block(False, '没有数据'),
+                  '眼动': _block(False, '眼动仪未接入'),
+                  '表情': _block(False, '表情模型未接入')}
+        # 心算任务是行为数据，库里没有生理信号包，但 trials 表能算出答题指标
+        mental, mental_note = extract_mental_math(db_path) if db_path else (None, '')
+        if mental:
+            result['心算'] = _block(True, mental_note, mental)
+            result['区间'] = (0, 0, mental.pop('_span_sec', 0) or 0)
+        vision, vision_note = extract_vision(db_path) if db_path else (None, '')
+        if vision:
+            result['视觉'] = _block(True, vision_note, vision)
+            if not result['区间'][2]:
+                result['区间'] = (0, 0, vision.get('检测时长(s)', 0) or 0)
+        return result
 
     first = packets[0][0]
     last = packets[-1][0]
@@ -438,8 +661,32 @@ def analyze_packets(packets, start: Optional[float] = None,
 
     ppg, ppg_ts = _collect_ppg(packets, start, end)
     ppg_fs = estimate_fs(ppg_ts, len(ppg), fallback=250.0)
-    pulse, pulse_note = extract_pulse(ppg, ppg_fs) if ppg else (None, '区间内没有 PPG 数据')
-    result['手环PPG'] = _block(bool(pulse), pulse_note, pulse, ppg_fs, len(ppg))
+
+    # 手环 PPG：优先走四通道融合（ppg_pipeline），算不出来再退回单通道轻量算法。
+    # 融合版能给出 SDNN/RMSSD/LF-HF/样本熵，且按 SQI 加权抑制坏通道；
+    # 单通道版只给脉率/脉间期，作为兜底。
+    fusion_used = False
+    if db_path:
+        try:
+            from analysis import ppg_fusion          # 局部导入：scipy 只在要用时才加载
+            fused_feats, fused_note, fused_fs = ppg_fusion.analyze(db_path, start, end)
+        except Exception as exc:                     # noqa: BLE001 - 融合层不能拖垮页面
+            fused_feats, fused_note, fused_fs = None, '四通道融合异常：{}'.format(exc), None
+        if fused_feats:
+            result['手环PPG'] = _block(True, fused_note, fused_feats,
+                                       fused_fs or ppg_fs, len(ppg))
+            fusion_used = True
+        else:
+            result['手环PPG'] = _block(False, '四通道融合不可用（{}）；下方为单通道结果'.format(
+                fused_note), None, ppg_fs, len(ppg))
+
+    if not fusion_used:
+        pulse, pulse_note = extract_pulse(ppg, ppg_fs) if ppg else (None, '区间内没有 PPG 数据')
+        if db_path and result.get('手环PPG', {}).get('说明'):
+            # 融合失败时保留原因，但不要因为单通道算出来就假装一切正常
+            pulse_note = '{}；单通道：{}'.format(
+                result['手环PPG']['说明'], pulse_note)
+        result['手环PPG'] = _block(bool(pulse), pulse_note, pulse, ppg_fs, len(ppg))
 
     # 皮电：packets 里是 `('bracelet', {'GSR': [每包 10 个值]})`，
     # _collect 会把 list 展平成一条序列；每个包只记一次时间戳，
@@ -457,6 +704,15 @@ def analyze_packets(packets, start: Optional[float] = None,
         eda, eda_note = (extract_eda(gsr, gsr_fs, gsr_seconds) if gsr
                          else (None, '区间内没有皮电数据'))
         result['皮电GSR'] = _block(bool(eda), eda_note, eda, gsr_fs, len(gsr))
+
+    mental, mental_note = (extract_mental_math(db_path) if db_path else (None, ''))
+    if mental:
+        mental.pop('_span_sec', None)
+        result['心算'] = _block(True, mental_note, mental)
+
+    vision, vision_note = extract_vision(db_path, start, end) if db_path else (None, '')
+    if vision:
+        result['视觉'] = _block(True, vision_note, vision)
 
     result['眼动'] = _block(False, '眼动仪未接入（预留）')
     result['表情'] = _block(False, '表情模型未接入（预留 YOLO）')
