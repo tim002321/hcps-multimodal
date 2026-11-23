@@ -8,7 +8,7 @@
 | `torch` | ultralytics + torch（可走 CUDA） | 首选，RTX 3060 上单帧 10~30ms |
 | `onnx` | onnxruntime + opencv | 降级，纯 CPU 也能到 10~20fps，不需要 2GB 的 torch |
 
-权重文件（`tools/vision/fetch_models.py` 获取）：
+权重文件（`debug_tools/vision/fetch_models.py` 获取）：
   * `models/yolov8n-face.pt`    —— torch 后端
   * `models/yolov8n-face.onnx`  —— onnx 后端
 
@@ -131,7 +131,7 @@ class FaceDetector:
                 errors.append('onnx 后端不可用：{}'.format(exc))
 
         raise RuntimeError('人脸检测模型加载失败：\n  ' + '\n  '.join(errors) +
-                           '\n请先运行 python tools/vision/fetch_models.py')
+                           '\n请先运行 python debug_tools/vision/fetch_models.py')
 
     def _load_torch(self) -> None:
         if not os.path.exists(TORCH_MODEL):

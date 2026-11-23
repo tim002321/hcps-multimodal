@@ -17,7 +17,7 @@
 `settimeout(0.3)` 的阻塞循环停止响应快、不会像 `sock_recvfrom` 那样在退出时
 卡在事件循环上；也不需要和 BLE 那个 loop 抢生命周期。
 
-单独联调（不启界面）：`tools/eye/listen_eye.py`。
+单独联调（不启界面）：`debug_tools/eye/listen_eye.py`。
 """
 from __future__ import annotations
 

@@ -49,20 +49,30 @@ AAAwindows_code/
 │   ├── mouth_state.py     HippoYD 张嘴概率（ONNX，走 cv2.dnn）
 │   ├── yawn_logic.py      时序状态机（纯 Python，可单测）
 │   └── yawn_monitor.py    后台推理线程 + 状态快照
-├── models/                推理权重（不进版本库，用 tools/vision/fetch_models.py 取）
-├── tools/                 排障与自检
-│   ├── ble/               扫描、扫描重试策略验证
-│   ├── camera/            摄像头枚举、帧导出
-│   ├── db/                库概览、合并、回放检查、同库验证
-│   ├── eye/               眼动联调（监听 / 假发送端）
-│   ├── vision/            权重下载、离线基准、阈值标定、实时概率探针
-│   ├── test_yawn_pipeline.py  打哈欠状态机断言
-│   ├── test_eye_protocol.py   眼动报文解析断言
-│   └── ui_screenshot.py   离屏截图 + 界面冒烟断言
+├── models/                推理权重（不进版本库，用 debug_tools/vision/fetch_models.py 取）
 ├── docs/                  架构说明 / 需求拆解 / 重构说明 / 手环协议文档
 ├── data/                  运行时生成的会话库
 └── ui_shots/              界面截图
 ```
+
+**排障与自检工具不在本目录内**（v1.0.1 起），已独立到仓库根的 `debug_tools/`：
+
+```
+<仓库根>/
+├── AAAwindows_code/       客户版主程序（不含任何 tools/）
+└── debug_tools/           内部排障工具，不参与打包
+    ├── ble/               扫描、重试策略验证、心电分级诊断与检测界面
+    ├── camera/            摄像头枚举、帧导出
+    ├── db/                库概览、合并、回放检查、同库验证
+    ├── eye/               眼动采集 / 联调 / 导入 / 回放 / 工具箱
+    ├── vision/            权重下载、离线基准、阈值标定、实时概率探针
+    ├── test_yawn_pipeline.py  打哈欠状态机断言
+    ├── test_eye_protocol.py   眼动报文解析断言
+    └── ui_screenshot.py   离屏截图 + 界面冒烟断言
+```
+
+这些工具默认从 `debug_tools/` 的上级目录定位 `AAAwindows_code/`，
+因此移动整个仓库仍可用；但**不要**把它们复制进 `AAAwindows_code/`，否则路径推导会多一层。
 
 ## 界面结构：四段式向导
 
@@ -203,7 +213,7 @@ python run_monitor.py --no-ble                 # 只开界面，稍后在「状�
 验证这条逻辑（不需要设备）：
 
 ```powershell
-python tools/ble/ble_retry_test.py
+python debug_tools/ble/ble_retry_test.py
 ```
 
 启动时想直接连设备：`python run_monitor.py --auto-connect`。
@@ -394,8 +404,8 @@ CREATE TABLE camera_videos (
 **给分析用**：导出入库的帧（新旧库都支持，新库直接从 frames/ 复制）
 
 ```powershell
-python tools/camera/export_camera_frames.py data/<会话>.db
-python tools/camera/export_camera_frames.py data/<会话>.db --out my_frames --every 15   # 每秒取 1 张
+python debug_tools/camera/export_camera_frames.py data/<会话>.db
+python debug_tools/camera/export_camera_frames.py data/<会话>.db --out my_frames --every 15   # 每秒取 1 张
 ```
 
 > 存储估算：640×480 / JPEG80 ≈ 18~35KB/帧 → **15fps 照片 ≈ 1.0~1.9 GB/小时**，
@@ -404,14 +414,14 @@ python tools/camera/export_camera_frames.py data/<会话>.db --out my_frames --e
 验证存储结构（不需要硬件）：
 
 ```powershell
-python tools/db/test_media_storage.py   # 照片落盘/表结构/视频/缺帧容错/老库兼容
-python tools/db/test_shared_db.py       # 传感器数据与照片/视频同会话目录、回放时间轴可合并
+python debug_tools/db/test_media_storage.py   # 照片落盘/表结构/视频/缺帧容错/老库兼容
+python debug_tools/db/test_shared_db.py       # 传感器数据与照片/视频同会话目录、回放时间轴可合并
 ```
 
 没有硬件时用 `--replay` 或第②段的回放面板；截图自检：
 
 ```powershell
-python tools/ui_screenshot.py     # 用历史数据填满界面，按「阶段 + 标签页」离屏截图到 ui_shots/
+python debug_tools/ui_screenshot.py     # 用历史数据填满界面，按「阶段 + 标签页」离屏截图到 ui_shots/
 ```
 
 > 注意：`data/` 里现有的几段录音，心电通道大部分时间是 ±1 的底噪（电极未接触），
@@ -483,7 +493,7 @@ pip install ultralytics
 pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --index-url https://download.pytorch.org/whl/cu121
 
 # 3) 下模型（权重不进版本库）
-python tools/vision/fetch_models.py
+python debug_tools/vision/fetch_models.py
 ```
 
 没有 GPU 时，用 `--with-onnx` 再下一个 `yolov8n-face.onnx`，并把 `config.ini`
@@ -508,7 +518,7 @@ D:/calib/
 ```
 
 ```powershell
-python tools/vision/calibrate_threshold.py --data D:/calib
+python debug_tools/vision/calibrate_threshold.py --data D:/calib
 ```
 
 它会在 0.05~0.95 上扫阈值、打印精确率/召回率/F1，并给出建议值，写回 `config.ini` 即可。
@@ -517,17 +527,17 @@ python tools/vision/calibrate_threshold.py --data D:/calib
 
 ```powershell
 # 不加载模型的链路自检（任意机器都能跑）
-python tools/vision/bench_yawn.py --source stub
+python debug_tools/vision/bench_yawn.py --source stub
 
 # 用历史会话库里的摄像头帧跑真实推理，看延迟与命中率
-python tools/vision/bench_yawn.py --source db:data/camera_20261017_150214.db --frames 120
+python debug_tools/vision/bench_yawn.py --source db:data/camera_20261017_150214.db --frames 120
 
 # 时序状态机的行为断言
-python tools/test_yawn_pipeline.py
+python debug_tools/test_yawn_pipeline.py
 
 # 实时探针：对着摄像头说话/闭嘴/打哈欠，逐帧打印张嘴概率并给出分位数
 # —— 调阈值或怀疑「不灵敏」时先跑这个，别靠猜
-python tools/vision/live_probe.py --seconds 60
+python debug_tools/vision/live_probe.py --seconds 60
 ```
 
 ### 本机实测（RTX 3060 Laptop 6GB / torch 2.5.1+cu121）
@@ -542,7 +552,7 @@ python tools/vision/live_probe.py --seconds 60
 | 界面内稳定帧率 | 6.2 fps（受 `interval=0.15` 限速，不是性能瓶颈） |
 | 张嘴误报 | 闭嘴静坐 40 帧，概率全部 ≤0.0003，零误报 |
 
-跑法：`python tools/vision/bench_yawn.py --source db:data/<含摄像头帧的会话>.db --frames 200`
+跑法：`python debug_tools/vision/bench_yawn.py --source db:data/<含摄像头帧的会话>.db --frames 200`
 
 > 基准和推理线程都带预热。首帧要跑 CUDA 上下文初始化和 cuDNN 选算法，实测单帧
 > 能到 900 ms 以上；不预热的话界面第一秒会显示「1.1fps / 993ms」，看着像模型很慢。
@@ -660,7 +670,7 @@ python run_monitor.py --no-eye       # 临时关掉
 python receive_tcp_5001.py --no-raw
 
 # 2) 合：把会话目录传进去，自己找同时间段的 CSV 并导入
-python tools/eye/import_eye_csv.py --db data/张三/任务A_20261117_171900 --write
+python debug_tools/eye/import_eye_csv.py --db data/张三/任务A_20261117_171900 --write
 ```
 
 不给 `--db` 就挑 `data` 下最新的会话库；`--db` 可以给 `.db` 文件，也可以给会话目录
@@ -670,7 +680,7 @@ python tools/eye/import_eye_csv.py --db data/张三/任务A_20261117_171900 --wr
 先看配对情况（不写库）：
 
 ```bash
-python tools/eye/import_eye_csv.py --list
+python debug_tools/eye/import_eye_csv.py --list
 ```
 
 输出每个会话的时间窗、能配上的 CSV、重叠秒数、以及该会话已导入多少行眼动。
@@ -716,23 +726,23 @@ right_pupil`、`ts_unix/ts_raw`，以及 `src: "csv-import"` —— 事后能分
    ON ABS(julianday(c.time) - julianday(e.time)) * 86400 <= 0.01;
   ```
 
-**没设备时怎么验证**：`tools/eye/replay_eye_csv.py` 能把录下来的 CSV 还原成原始 JSON
+**没设备时怎么验证**：`debug_tools/eye/replay_eye_csv.py` 能把录下来的 CSV 还原成原始 JSON
 帧、按原始节奏发 TCP，让 `receive_tcp_5001.py` 去连——实测 3790 帧逐字段零差异。
 
 ### 联调（没有设备也能跑通）
 
 ```bash
 # 1) 单独监听，看解析结果与统计（不开界面、不落库）
-python tools/eye/listen_eye.py --seconds 10
+python debug_tools/eye/listen_eye.py --seconds 10
 
 # 2) 顺便落库，验证 JSON 结构（库在系统临时目录，不污染 data/）
-python tools/eye/listen_eye.py --save --seconds 10
+python debug_tools/eye/listen_eye.py --save --seconds 10
 
 # 3) 完全没有设备时：另开一个窗口造帧，把整条链路跑通
-python tools/eye/fake_eye_sender.py --seconds 5
+python debug_tools/eye/fake_eye_sender.py --seconds 5
 
 # 4) 解析器自检（42 项断言，不需要设备/网络）
-python tools/test_eye_protocol.py
+python debug_tools/test_eye_protocol.py
 ```
 
 界面上的「眼动仪」页会显示收包/解析/失败/入库四个计数和最新一帧的每个字段，

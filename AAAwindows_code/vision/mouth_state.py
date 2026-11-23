@@ -31,7 +31,7 @@ COLOR_CHANNELS = 1
 
 # 判定阈值。上游脚本用的是 0.2（很松，适合车载场景），
 # 我们的被试距离/光照/镜头都不同，所以这里给个中性的 0.5 作初值，
-# 真实阈值必须用 tools/vision/calibrate_threshold.py 在本地素材上标定。
+# 真实阈值必须用 debug_tools/vision/calibrate_threshold.py 在本地素材上标定。
 DEFAULT_THRESHOLD = 0.5
 
 # 模型是包内只读资源，打包后位于 _MEIPASS/models（不能用 __file__ 推导）
@@ -77,7 +77,7 @@ class MouthClassifier:
             return self
         if not os.path.exists(self.model_path):
             raise RuntimeError(
-                '缺少张嘴模型：{}\n请先运行 python tools/vision/fetch_models.py'
+                '缺少张嘴模型：{}\n请先运行 python debug_tools/vision/fetch_models.py'
                 .format(self.model_path))
 
         want = (self.backend or 'auto').lower()

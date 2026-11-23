@@ -44,9 +44,9 @@ F:\hcpsproject\PyCharmMiscProject\.venv\Scripts\python.exe app.py
 
 | 工具 | 入口 | 用途 |
 |---|---|---|
-| 心电贴分级诊断 | `python AAAwindows_code\tools\ble\diag_ecg.py --name E122...` | 扫描→建链→服务发现→特征→握手→收包，逐段定位卡点 |
-| 心电贴检测界面 | `python AAAwindows_code\tools\ble\ecg_probe_gui.py --auto E122...` | 实时波形、丢包率、体温、MTU、退避重连 |
-| 眼动工具箱 | `python AAAwindows_code\tools\eye\eye_toolkit_gui.py` | 实时入库 / 录制 CSV / 导入到库 / 回放测试 |
+| 心电贴分级诊断 | `python debug_tools\ble\diag_ecg.py --name E122...` | 扫描→建链→服务发现→特征→握手→收包，逐段定位卡点 |
+| 心电贴检测界面 | `python debug_tools\ble\ecg_probe_gui.py --auto E122...` | 实时波形、丢包率、体温、MTU、退避重连 |
+| 眼动工具箱 | `python debug_tools\eye\eye_toolkit_gui.py` | 实时入库 / 录制 CSV / 导入到库 / 回放测试 |
 | 眼动独立采集 | `python AAAwindows_code\receive_tcp_5001.py` | 连接 192.168.2.98:7901，原样落盘 |
 | 面部 ROI 处理 | `python face_tool\run_gui.py` 或 `run_cli.py` | 会话目录 → 眼/嘴 ROI + 68 点 + 逐帧指标 |
 

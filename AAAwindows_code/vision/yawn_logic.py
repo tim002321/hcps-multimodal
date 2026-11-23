@@ -5,7 +5,7 @@
 文献与工程上的通行做法是「张嘴持续超过 N 秒」才算一次哈欠，再加冷却避免把
 一次哈欠拆成多次。本模块就是这条规则，**不依赖任何第三方库**，可单独单测。
 
-四条规则（对应 tools/test_yawn_pipeline.py 的断言）：
+四条规则（对应 debug_tools/test_yawn_pipeline.py 的断言）：
   1. 张嘴持续 >= yawn_min_sec       → 计一次哈欠
   2. 只是闪一下（短于 yawn_min_sec） → 不计
   3. 计数后进入 cooldown            → 冷却期内不再重复计
@@ -42,7 +42,7 @@ FATIGUE_TEXT = {
     FATIGUE_SEVERE: '重度疲劳',
 }
 
-# 默认参数：都是"初值"，必须用 tools/vision/calibrate_threshold.py 在本地素材上标定
+# 默认参数：都是"初值"，必须用 debug_tools/vision/calibrate_threshold.py 在本地素材上标定
 DEFAULT_THRESHOLD = 0.5        # 张嘴概率阈值
 DEFAULT_YAWN_MIN_SEC = 1.5     # 连续张嘴多久算一次哈欠
 DEFAULT_COOLDOWN_SEC = 5.0     # 一次哈欠后的冷却
@@ -57,7 +57,7 @@ DEFAULT_DIP_GRACE_SEC = 0.3    # 概率短暂跌回阈值以下多久内不打�
 # 10 帧全部达标，中间任意一帧因为人脸框轻微抖动、被手挡一下、或模型自己在
 # 临界值上跳一下，整个哈欠就白打了 —— 这是「识别不灵敏」最主要的原因。
 # 给 0.3 秒（约 2 帧）的容忍窗口，既不打断真实哈欠，又不会被 0.5 秒级的
-# 说话张嘴蒙混过去（见 tools/test_yawn_pipeline.py 用例 2）。
+# 说话张嘴蒙混过去（见 debug_tools/test_yawn_pipeline.py 用例 2）。
 
 
 
