@@ -28,7 +28,7 @@ AAAwindows_code/ecg_data.jsonl
 # 自检/冒烟测试跑出来的结果库（任何层级的「实验结果」目录）
 实验结果/
 
-# 推理模型权重：单个 6~13MB，用 tools/vision/fetch_models.py 获取，不进版本库
+# 推理模型权重：单个 6~13MB，用 debug_tools/vision/fetch_models.py 获取，不进版本库
 AAAwindows_code/models/*.pt
 AAAwindows_code/models/*.onnx
 AAAwindows_code/models/*.part
@@ -77,7 +77,7 @@ AAAwindows_code/眼动数据_*.txt
 mental_math_results/
 
 # ---- 本机设置（含现场设备 IP，不应进库）----
-AAAwindows_code/tools/eye/.eye_live_gui.json
+debug_tools/eye/.eye_live_gui.json
 
 # ---- 回滚备份目录 ----
 _backup_*/
@@ -93,3 +93,15 @@ face_tool/_test_out/
 face_tool/_test_gui/
 face_tool/.gui_state.json
 face_tool/**/__pycache__/
+
+# ---- 凭据与取数口令（公开仓库，严禁入库）----
+mental_math_passcode.txt
+*passcode*.txt
+*.pem
+*.key
+id_rsa*
+.env
+.env.*
+
+# ---- 文档渲染中间产物 ----
+_pdfsrc/

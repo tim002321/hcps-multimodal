@@ -1,0 +1,47 @@
+# 统一换行与二进制判定
+# 目的：Windows / macOS / Linux 混用时，不出现「整个文件都被改动」的假 diff。
+
+* text=auto eol=lf
+
+# ---- 文本 ----
+*.py       text eol=lf
+*.md       text eol=lf
+*.ini      text eol=lf
+*.cfg      text eol=lf
+*.json     text eol=lf
+*.jsonl    text eol=lf
+*.yaml     text eol=lf
+*.yml      text eol=lf
+*.txt      text eol=lf
+*.spec     text eol=lf
+*.csv      text eol=lf
+*.gitignore text eol=lf
+
+# ---- Windows 脚本保留 CRLF ----
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+*.ps1      text eol=crlf
+
+# ---- 二进制：不做换行转换、不参与文本 diff ----
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.bmp      binary
+*.ico      binary
+*.mp4      binary
+*.avi      binary
+*.wav      binary
+*.pdf      binary
+*.zip      binary
+*.7z       binary
+*.bundle   binary
+*.pt       binary
+*.onnx     binary
+*.dat      binary
+*.h5       binary
+*.cbm      binary
+*.pkl      binary
+*.db       binary
+*.exe      binary
+*.dll      binary

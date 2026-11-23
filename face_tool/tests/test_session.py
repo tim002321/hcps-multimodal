@@ -6,8 +6,10 @@ import unittest
 from facetool import db as db_mod
 from facetool.session import discover_session
 
-NEW_SESSION = (r'F:\hcpsproject\PyCharmMiscProject\AAAwindows_code\dist\HcpsMonitor'
-               r'\data\薛锦民\1_20261117_192737')
+# 样本会话路径从环境变量读取，仓库里不放真实被试姓名。
+# 本地跑集成测试前先设置：
+#   set HCP_SAMPLE_SESSION=F:\...\data\<被试>\<会话目录>
+NEW_SESSION = os.environ.get('HCP_SAMPLE_SESSION', '')
 LEGACY_DB = (r'F:\hcpsproject\PyCharmMiscProject\AAAwindows_code\data\123'
              r'\123_20261103_142125\20261103_142134.db')
 

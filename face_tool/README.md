@@ -9,10 +9,10 @@
 
 ```bash
 # 先看一眼这个会话有多少帧、什么结构
-.venv\Scripts\python.exe face_tool\run_cli.py --scan "D:\data\薛锦民\1_20261117_192737"
+.venv\Scripts\python.exe face_tool\run_cli.py --scan "D:\data\sub-014\1_20261117_192737"
 
 # 处理到指定目录
-.venv\Scripts\python.exe face_tool\run_cli.py "D:\data\薛锦民\1_20261117_192737" -o "D:\out"
+.venv\Scripts\python.exe face_tool\run_cli.py "D:\data\sub-014\1_20261117_192737" -o "D:\out"
 
 # 图形界面
 .venv\Scripts\python.exe face_tool\run_gui.py
@@ -138,7 +138,7 @@ CLI 参数与 GUI 一一对应，全部有默认值，一般不用改：
 启动日志会打印三个模型的存在状态。生成 onnx：
 
 ```bash
-.venv\Scripts\python.exe AAAwindows_code\tools\vision\fetch_models.py --with-onnx
+.venv\Scripts\python.exe debug_tools\vision\fetch_models.py --with-onnx
 ```
 
 **2) 提示「读库失败」**

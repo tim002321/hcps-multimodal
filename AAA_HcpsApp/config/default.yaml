@@ -111,13 +111,15 @@ collectors:
     audio_dir: 异常状态预警音
 
   # ---- 采集卡主机控制：SSH（待迁移）----
+  # 凭据不进仓库：运行时从环境变量读取
+  #   HCP_SSH_HOST / HCP_SSH_USER / HCP_SSH_PASSWORD
   ctrl:
     enabled: false
     transport: ssh
-    host: 192.168.1.179          # 老 [collect] ip
+    host: ""                      # 例：192.168.x.x（现场填，勿提交）
     port: 22
-    user: rock                   # 老代码里硬编码 rock/rock，这里提到配置里
-    password: rock
+    user: ""
+    password: ""
 
 # ---- A2 分析层参数（老代码把这些值写在函数默认参数里、模型路径写死在代码里）----
 analyze:

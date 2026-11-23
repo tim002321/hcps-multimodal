@@ -2,7 +2,7 @@
 """命令行入口。
 
 例：
-    python run_cli.py --scan "D:\\data\\薛锦民\\1_20261117_192737"
+    python run_cli.py --scan "D:\\data\\sub-014\\1_20261117_192737"
     python run_cli.py "D:\\data\\...\\1_20261117_192737" -o "D:\\out"
     python run_cli.py "..." -o "D:\\out" --limit 20 --backend dlib
 """

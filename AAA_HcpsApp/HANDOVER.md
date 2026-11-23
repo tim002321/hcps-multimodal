@@ -110,7 +110,7 @@ $dst = 'F:\hcpsproject\PyCharmMiscProject\AAA_HcpsApp'
 ## 4. 待办（按建议优先级）
 
 1. **A5_link：ctrl**（老 `collect_control_thread.py`）——SSH 登录采集卡主机
-   （`[collect] ip`，rock/rock），做三件事：`sudo date -s` 对时、启动 `app_collect`、`pkill` 停止。
+   （`[collect] ip`，用户名口令见现场，不在仓库保存），做三件事：`sudo date -s` 对时、启动 `app_collect`、`pkill` 停止。
    老代码密码/路径全硬编码，需要提到配置。
 2. **A4_alert：alert**（老 `alert.py`）——TCP 收单个 0/1 标志；最近 3 个都是 1 -> 高级警报；
    最近 5 个里 1 的个数在 2~4 -> 中级；不足 5 个不报；播
