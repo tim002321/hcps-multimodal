@@ -1380,6 +1380,8 @@ class CameraPage(BasePage):
         # 先用「上次选的 / config 的」序号占位，扫描结果回来再按名字对齐
         self._camera_items: List[Dict[str, Any]] = []
         self._scan_thread: Optional[_CameraScanThread] = None
+        self._open_at = 0.0
+        self._open_deadline = 0.0
         _want = self.window_ref.camera_index_choice
         if _want is None:
             _want = getattr(cam_cfg, 'camera_index', 0)
@@ -1399,6 +1401,7 @@ class CameraPage(BasePage):
                 int(getattr(cam_cfg, 'camera_height', 480) or 480))
         index = next((i for i, (_t, size) in enumerate(sizes) if size == want), 0)
         self.size_combo.setCurrentIndex(index)
+        self.size_combo.currentIndexChanged.connect(lambda _i: self._schedule_restart())
         row2.addWidget(self.size_combo, 1)
         settings.add_layout(row2)
 
@@ -1530,6 +1533,8 @@ class CameraPage(BasePage):
         hint = getattr(self, 'device_hint', None)
         if hint is not None and not quiet and name:
             hint.setText('当前：{}（index {}）'.format(name, index))
+        if not quiet:
+            self._schedule_restart()      # 正在采集就自动用新设备重开
 
     def _selected_index(self) -> int:
         """下拉框当前选中的 index；还没扫到时用占位项的值。"""
@@ -1551,8 +1556,12 @@ class CameraPage(BasePage):
             self.start_button.setObjectName('Primary')
             self.start_button.setStyle(self.start_button.style())
             self.status_pill.setText('已停止')
-            self._set_device_enabled(True)
             return
+        self._start_camera()
+
+    def _start_camera(self) -> None:
+        """按界面上的参数启动采集（首帧没到之前显示「正在打开」）。"""
+        window = self.window_ref
         width, height = self.size_combo.currentData()
         config = {
             'index': self._selected_index(),
@@ -1562,31 +1571,53 @@ class CameraPage(BasePage):
             'quality': int(self.quality_spin.value()),
             'backend': 'dshow',
         }
+        # 4K 那台首帧要 6 秒左右（实测），期间 latest_frame 一直是 None。
+        # 先给一个"正在打开"，等第一帧到了再换「采集中」，否则用户以为没反应。
+        self._open_at = time.monotonic()
+        self._open_deadline = self._open_at + 20.0
+        self.status_pill.setText('正在打开…')
+        self.frame_label.setText('正在打开摄像头（4K 设备首帧约 5~8 秒）…')
         try:
             db_path = window.start_camera(config)
         except Exception as exc:                      # noqa: BLE001
             self.status_pill.setText('启动失败')
             self.db_label.setText(str(exc))
+            self.frame_label.setText('启动失败：{}'.format(exc))
             return
-        self.db_label.setText('索引库：{}\n图片：{}'.format(db_path,
-                                                       self.camera_service.frames_dir))
+        self.db_label.setText('索引库：{}\n图片：{}'.format(
+            db_path, window.camera_service.frames_dir))
         self.start_button.setText('停止采集')
         self.start_button.setObjectName('Danger')
         self.start_button.setStyle(self.start_button.style())
-        self.status_pill.setText('采集中')
-        self._set_device_enabled(False)               # 采集中不让换设备（DShow 独占）
         # 勾了「启用打哈欠检测」就在采集启动后加载模型（首次约 2~5 秒）
         if self.yawn_check.isChecked():
             self._on_yawn_toggled(True)
 
-    def _set_device_enabled(self, enabled: bool) -> None:
-        """采集中禁用设备下拉与刷新，避免"点了没反应"的困惑。"""
-        for widget in (getattr(self, 'device_combo', None), getattr(self, 'scan_button', None)):
-            if widget is not None:
-                widget.setEnabled(enabled)
-        hint = getattr(self, 'device_hint', None)
-        if hint is not None and not enabled:
-            hint.setText('采集中（停止后可换设备）')
+    def _restart_camera(self) -> None:
+        """运行中换了设备/分辨率：停掉再按新参数起来。
+
+        DShow 是独占的，没法在跑着的时候把设备换掉；但让用户「先点停止、
+        再点开始」太容易以为下拉没用（现场就是这么误会的）。这里自动重启。
+        """
+        window = self.window_ref
+        if window.camera_service is None or not window.camera_service.running:
+            return
+        self.status_pill.setText('切换设备…')
+        window.stop_camera()
+        self._start_camera()
+
+    def _schedule_restart(self) -> None:
+        """下拉换一项就重启一次太频繁，等 600ms 没再动再执行。"""
+        window = self.window_ref
+        if window.camera_service is None or not window.camera_service.running:
+            return
+        timer = getattr(self, '_restart_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._restart_camera)
+            self._restart_timer = timer
+        timer.start(600)
 
     def _on_yawn_toggled(self, checked: bool) -> None:
         window = self.window_ref
@@ -1620,6 +1651,7 @@ class CameraPage(BasePage):
             return
         latest = service.latest_frame()
         if latest is None:
+            self._show_opening(service)
             return
         jpeg, index, stamp = latest
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -1634,6 +1666,35 @@ class CameraPage(BasePage):
             max(64, self.preview.width() - 4), max(64, self.preview.height() - 4),
             Qt.KeepAspectRatio, Qt.SmoothTransformation))
         self.frame_label.setText('帧 #{:<7d}  {}  {}×{}'.format(index, stamp, width, height))
+
+    def _show_opening(self, service) -> None:
+        """还没拿到第一帧：说清楚是在打开、超时了、还是直接失败。
+
+        4K 那台在 DSHOW 下首帧要 6 秒左右，之前界面一直停在「采集中」+ 黑屏，
+        看起来就是"选了设备没反应"。这里按耗时和采集线程给的错误分开报。
+        """
+        stats = {}
+        try:
+            stats = service.capture.stats()
+        except Exception:                             # noqa: BLE001
+            pass
+        error = str(stats.get('error') or '')
+        waited = time.monotonic() - float(getattr(self, '_open_at', time.monotonic()))
+        if error:
+            self.status_pill.setText('打开失败')
+            self.frame_label.setText('打开失败：{}（可换一台设备再试）'.format(error))
+            return
+        deadline = float(getattr(self, '_open_deadline', 0.0) or 0.0)
+        if deadline and time.monotonic() > deadline:
+            self.status_pill.setText('无画面')
+            self.frame_label.setText(
+                '等了 {:.0f} 秒仍没有画面：确认这台摄像头没被别的程序占着，'
+                '或换一台设备试试'.format(waited))
+            return
+        self.status_pill.setText('正在打开…')
+        self.frame_label.setText(
+            '正在打开摄像头（index {}，已等 {:.0f} 秒；4K 设备首帧约 5~8 秒）…'.format(
+                self._selected_index(), waited))
 
     def _draw_faces(self, frame) -> None:
         """把推理线程给的人脸框叠到画面上：张嘴标红、闭合标绿。"""
@@ -1680,7 +1741,9 @@ class CameraPage(BasePage):
         self.tile_size.set_value(f'{stats["total_bytes"] / 1024 / 1024:.1f}')
         if stats.get('error'):
             self.status_pill.setText(stats['error'])
-        elif service.running:
+        elif service.running and stats['frames'] > 0:
+            # frames == 0 时别抢 pill：首帧还没到，_refresh_preview 会显示
+            # 「正在打开…（已等 N 秒）」/「无画面」，这里覆盖会来回闪
             self.status_pill.setText(f'采集中 {stats["frames"]} 帧')
         # 按钮状态跟实际采集状态同步（由「设备准备」启动时也能看到"停止采集"）
         running = service.running

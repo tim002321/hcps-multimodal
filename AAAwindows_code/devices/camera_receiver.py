@@ -320,7 +320,10 @@ class CameraCapture(threading.Thread):
         self.fps = float(config.get('fps', DEFAULT_FPS))
         self.quality = int(config.get('quality', DEFAULT_QUALITY))
         self.camera = str(config.get('camera', 'usb0'))
-        self.warmup = int(config.get('warmup', 3))
+        # 预热帧数：DSHOW 刚打开时前几帧常是黑的。原来写 3 帧，但 4K 摄像头
+        # 每次 read 在启动阶段要阻塞 ~2 秒（实测首帧 6 秒），3 帧就白等 4 秒。
+        # 1 帧足够躲过全黑帧，剩下的等画面自己稳定。
+        self.warmup = int(config.get('warmup', 1))
         self._capture_factory = capture_factory
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
@@ -375,6 +378,13 @@ class CameraCapture(threading.Thread):
     def run(self) -> None:
         import cv2
 
+        # 4K 那台（4K AutoFocus Webcam）在 DSHOW 下的首帧要 6 秒左右，
+        # 期间界面看起来"什么都没发生"。这里把开始/完成两行都打出来，
+        # 并且界面按 connected 标志显示"正在打开"。warmup 从 3 降到 1：
+        # 每次 read 在首帧阶段都是阻塞的，多读 2 帧只会多等 4 秒。
+        t_open = time.monotonic()
+        print('[摄像头] 正在打开 index={}（4K/USB 摄像头首帧常要 3~8 秒）…'.format(
+            self.index), flush=True)
         cap = self._open_capture()
         if cap is None or not cap.isOpened():
             self.error = '打不开摄像头 index={}'.format(self.index)
@@ -385,8 +395,9 @@ class CameraCapture(threading.Thread):
         cap.set(cv2.CAP_PROP_FPS, self.fps)
         for _ in range(max(0, self.warmup)):
             cap.read()
-        print('[摄像头] 已打开 index={} {}x{} 目标 {}fps，图片存 {}'.format(
-            self.index, self.width, self.height, self.fps, self.writer.frames_dir), flush=True)
+        print('[摄像头] 已打开 index={} {}x{} 目标 {}fps，耗时 {:.1f}s，图片存 {}'.format(
+            self.index, self.width, self.height, self.fps,
+            time.monotonic() - t_open, self.writer.frames_dir), flush=True)
 
         interval = 1.0 / self.fps if self.fps > 0 else 0.0
         next_due = time.monotonic()

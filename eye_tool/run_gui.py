@@ -345,6 +345,7 @@ class Window(QtWidgets.QMainWindow):
             if self.status.text().startswith('摄像头'):
                 self.status.setText('%s 已切到 1080p（4K 多半不支持）' % name)
         save_prefs(name, self.params.capture.width, self.params.capture.height)
+        self._schedule_restart()
 
     def on_size_changed(self, _row):
         data = self.combo_size.currentData()
@@ -352,6 +353,7 @@ class Window(QtWidgets.QMainWindow):
             return
         self.params.capture.width, self.params.capture.height = int(data[0]), int(data[1])
         save_prefs(self.params.capture.device, *data)
+        self._schedule_restart()
 
     def _sync_size_combo(self):
         """把下拉框对齐到当前参数（含不在候选表里的自定义分辨率）。"""
@@ -369,29 +371,53 @@ class Window(QtWidgets.QMainWindow):
         self._sync_size_combo()
 
     def _set_camera_controls(self, enabled):
-        """采集进行中禁掉设备/分辨率下拉：改参数要重开流才生效，点了没反应会误以为坏了。"""
-        self.combo_device.setEnabled(enabled)
-        self.combo_size.setEnabled(enabled)
+        """扫描按钮状态。设备/分辨率下拉**不禁用**：采集时换一台也能用，
+        只是在内部自动停流再重开（见 _schedule_restart）——之前锁死下拉，
+        用户会以为"选了也改不了"。"""
         self.btn_scan.setEnabled(enabled)
 
-    def toggle(self):
+    def _schedule_restart(self):
+        """换设备/分辨率后自动重开流。600ms 防抖，避免上下键选时连起重启。"""
         if self.worker is None:
-            self.worker = Worker(self.params, self.out_dir)
-            self.worker.updated.connect(self.on_update)
-            self.worker.failed.connect(self.on_fail)
-            self.worker.status.connect(self.status.setText)
-            self.worker.start()
-            self.btn_start.setText('停止')
-            self.status.setText('运行中')
-            self._set_camera_controls(False)
-        else:
+            return
+        timer = getattr(self, '_restart_timer', None)
+        if timer is None:
+            timer = QtCore.QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._restart_worker)
+            self._restart_timer = timer
+        timer.start(600)
+
+    def _restart_worker(self):
+        if self.worker is None:
+            return
+        self.status.setText('切换设备，重新打开…')
+        self._stop_worker()
+        self._start_worker()
+
+    def _start_worker(self):
+        self.worker = Worker(self.params, self.out_dir)
+        self.worker.updated.connect(self.on_update)
+        self.worker.failed.connect(self.on_fail)
+        self.worker.status.connect(self.status.setText)
+        self.worker.start()
+        self.btn_start.setText('停止')
+        self.status.setText('运行中')
+
+    def _stop_worker(self):
+        if self.worker is not None:
             self.worker.stop()
             self.worker.wait(3000)
             self.save_csv()
             self.worker = None
-            self.btn_start.setText('开始')
+        self.btn_start.setText('开始')
+
+    def toggle(self):
+        if self.worker is None:
+            self._start_worker()
+        else:
+            self._stop_worker()
             self.status.setText('已停止')
-            self._set_camera_controls(True)
 
     def on_fail(self, msg):
         self.status.setText(msg)
