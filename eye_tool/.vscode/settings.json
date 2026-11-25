@@ -1,0 +1,9 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/../shifeiyuantwo/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true,
+  "files.encoding": "utf8",
+  "terminal.integrated.cwd": "${workspaceFolder}",
+  "python.analysis.extraPaths": [
+    "."
+  ]
+}

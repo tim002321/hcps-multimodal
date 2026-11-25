@@ -1,0 +1,57 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "眼动工具：实时界面",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_gui.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/../shifeiyuantwo/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "args": ["--provider", "cuda"],
+      "justMyCode": true
+    },
+    {
+      "name": "眼动工具：界面（自动截图 15 秒后退出）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_gui.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/../shifeiyuantwo/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "args": ["--provider", "cuda", "--shot", "15"],
+      "justMyCode": true
+    },
+    {
+      "name": "眼动工具：取景检查（单帧）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/check_view.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/../shifeiyuantwo/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "args": [],
+      "justMyCode": true
+    },
+    {
+      "name": "眼动工具：离线分析（当前文件/文件夹）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/run_offline.py",
+      "cwd": "${workspaceFolder}",
+      "python": "${workspaceFolder}/../shifeiyuantwo/Scripts/python.exe",
+      "console": "integratedTerminal",
+      "args": ["--input", "${input:inputPath}", "--save-frames", "3"],
+      "justMyCode": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "inputPath",
+      "type": "promptString",
+      "description": "要分析的视频 / 图片目录 / 单张图片路径",
+      "default": "out/probe4k"
+    }
+  ]
+}
