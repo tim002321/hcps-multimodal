@@ -1490,12 +1490,17 @@ class CameraPage(BasePage):
         if want_index is None:
             want_index = getattr(getattr(window, 'cfg', None), 'camera_index', 0)
         pick = resolve_index(self._camera_items, want_index, want_name)
-        if want_index is not None and pick != int(want_index or 0):
-            self.device_hint.setText(
-                '上次选的那台不在线，已改为 index {}。'
-                '（上次记的是 index {}，插拔后序号会变）'.format(pick, want_index))
+        # 提示怎么认出这一台的：插拔后序号会漂，但名字不会
+        by_name = None
+        if want_name:
+            by_name = next((int(item['index']) for item in self._camera_items
+                            if str(item.get('name') or '') == want_name), None)
+        if by_name is not None and want_index is not None and by_name != int(want_index):
+            hint = '已按名字找回「{}」，序号 {} → {}'.format(want_name, want_index, by_name)
+        elif by_name is None and want_name and pick != int(want_index or 0):
+            hint = '上次那台「{}」不在线，改为 index {}'.format(want_name, pick)
         else:
-            self.device_hint.setText('共 {} 台可选'.format(len(self._camera_items)))
+            hint = '共 {} 台可选'.format(len(self._camera_items))
 
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
@@ -1505,10 +1510,11 @@ class CameraPage(BasePage):
                     if int(item['index']) == pick), 0)
         self.device_combo.setCurrentIndex(row)
         self.device_combo.blockSignals(False)
-        # 让「设备准备页 / 重启采集」也用这一台
-        self._on_device_changed(row)
+        self.device_hint.setText(hint)
+        # 让「设备准备页 / 重启采集」也用这一台（quiet：别把上面这条提示冲掉）
+        self._on_device_changed(row, quiet=True)
 
-    def _on_device_changed(self, row: int) -> None:
+    def _on_device_changed(self, row: int, quiet: bool = False) -> None:
         index = self._selected_index()
         name = ''
         if 0 <= row < len(getattr(self, '_camera_items', [])):
@@ -1522,7 +1528,7 @@ class CameraPage(BasePage):
         except Exception:                             # noqa: BLE001 - 记不住也不影响采集
             pass
         hint = getattr(self, 'device_hint', None)
-        if hint is not None and name:
+        if hint is not None and not quiet and name:
             hint.setText('当前：{}（index {}）'.format(name, index))
 
     def _selected_index(self) -> int:
