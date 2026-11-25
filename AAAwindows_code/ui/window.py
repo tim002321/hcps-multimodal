@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont, QImage, QPixmap
 from PyQt5.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFrame,
                              QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMainWindow,
@@ -1293,6 +1293,25 @@ class PlaybackPage(BasePage):
                 position + 1, total, fraction * 100.0, player.speed))
 
 
+class _CameraScanThread(QThread):
+    """后台枚举摄像头。
+
+    为什么不在界面线程里直接扫：ffmpeg -list_devices 要 0.3~1 秒，兜底探测
+    要逐个打开设备（更慢）。放在界面线程会让点「刷新」时整个窗口卡住。
+    """
+
+    found = pyqtSignal(list)
+
+    def run(self) -> None:                            # noqa: D401 - Qt 线程入口
+        items = []
+        try:
+            from devices.camera_devices import list_cameras
+            items = list_cameras(use_cache=False)
+        except Exception:                             # noqa: BLE001 - 枚举失败就返回空
+            items = []
+        self.found.emit(items)
+
+
 class CameraPage(BasePage):
     """USB 摄像头：实时预览 + 按配置帧率（默认 15fps）截帧入库。"""
 
@@ -1337,16 +1356,38 @@ class CameraPage(BasePage):
             layout.addWidget(name)
             return layout
 
-        row = field_row('设备号')
+        row = field_row('摄像头')
         cam_cfg = getattr(self.window_ref, 'cfg', None)
-        self.device_spin = QDoubleSpinBox()
-        self.device_spin.setDecimals(0)
-        self.device_spin.setRange(0, 9)
-        self.device_spin.setValue(float(getattr(cam_cfg, 'camera_index', 0) or 0))
-        self.device_spin.setFixedWidth(70)
-        row.addWidget(self.device_spin)
-        row.addStretch(1)
+        self.device_combo = QComboBox()
+        self.device_combo.setToolTip(
+            '列出本机所有 USB/UVC 摄像头（DirectShow）。\n'
+            '换设备后点「开始采集」生效；选择会记在 data/camera_prefs.json，\n'
+            '下次打开自动选回同一台（插拔后序号变了也能按名字认出来）。')
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
+        row.addWidget(self.device_combo, 1)
+        self.scan_button = QPushButton('刷新')
+        self.scan_button.setFixedWidth(theme.scaled(52))
+        self.scan_button.setToolTip('重新扫描本机摄像头（插拔后点这里）')
+        self.scan_button.clicked.connect(lambda: self._start_scan(manual=True))
+        row.addWidget(self.scan_button)
         settings.add_layout(row)
+
+        # 设备名单独一行显示：combo 只有 180px，长名字会被截断
+        self.device_hint = mono('正在扫描…')
+        self.device_hint.setWordWrap(True)
+        settings.add(self.device_hint)
+
+        # 先用「上次选的 / config 的」序号占位，扫描结果回来再按名字对齐
+        self._camera_items: List[Dict[str, Any]] = []
+        self._scan_thread: Optional[_CameraScanThread] = None
+        _want = self.window_ref.camera_index_choice
+        if _want is None:
+            _want = getattr(cam_cfg, 'camera_index', 0)
+        self.device_combo.blockSignals(True)
+        self.device_combo.addItem('{} · 正在扫描…'.format(int(_want or 0)),
+                                  int(_want or 0))
+        self.device_combo.blockSignals(False)
+        QTimer.singleShot(120, self._start_scan)      # 页面建好后再扫，不拖慢启动
 
         row2 = field_row('分辨率')
         self.size_combo = QComboBox()
@@ -1420,6 +1461,81 @@ class CameraPage(BasePage):
         self.preview_timer.timeout.connect(self._refresh_preview)
         self.preview_timer.start(33)                  # 约 30fps 刷新预览
 
+    # ------------------------------------------------------------- 设备枚举
+    def _start_scan(self, manual: bool = False) -> None:
+        """后台扫一遍本机摄像头，结果回主线程填下拉框。"""
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            return
+        if manual:
+            self.device_hint.setText('正在重新扫描…')
+        self.scan_button.setEnabled(False)
+        self._scan_thread = _CameraScanThread(self)
+        self._scan_thread.found.connect(self._on_scan_done)
+        self._scan_thread.start()
+
+    def _on_scan_done(self, items: List[Dict[str, Any]]) -> None:
+        from devices.camera_devices import display_name, resolve_index
+
+        self.scan_button.setEnabled(True)
+        self._camera_items = list(items or [])
+        if not self._camera_items:
+            self.device_hint.setText(
+                '没扫到摄像头：检查 USB 是否插好、是否被别的程序（相机 App / 会议软件）占着，'
+                '或点「刷新」再试。')
+            return
+
+        window = self.window_ref
+        want_name = getattr(window, 'camera_name_choice', '')
+        want_index = getattr(window, 'camera_index_choice', None)
+        if want_index is None:
+            want_index = getattr(getattr(window, 'cfg', None), 'camera_index', 0)
+        pick = resolve_index(self._camera_items, want_index, want_name)
+        if want_index is not None and pick != int(want_index or 0):
+            self.device_hint.setText(
+                '上次选的那台不在线，已改为 index {}。'
+                '（上次记的是 index {}，插拔后序号会变）'.format(pick, want_index))
+        else:
+            self.device_hint.setText('共 {} 台可选'.format(len(self._camera_items)))
+
+        self.device_combo.blockSignals(True)
+        self.device_combo.clear()
+        for item in self._camera_items:
+            self.device_combo.addItem(display_name(item), int(item['index']))
+        row = next((i for i, item in enumerate(self._camera_items)
+                    if int(item['index']) == pick), 0)
+        self.device_combo.setCurrentIndex(row)
+        self.device_combo.blockSignals(False)
+        # 让「设备准备页 / 重启采集」也用这一台
+        self._on_device_changed(row)
+
+    def _on_device_changed(self, row: int) -> None:
+        index = self._selected_index()
+        name = ''
+        if 0 <= row < len(getattr(self, '_camera_items', [])):
+            name = str(self._camera_items[row].get('name') or '')
+        window = self.window_ref
+        window.camera_index_choice = index
+        window.camera_name_choice = name
+        try:
+            from devices.camera_devices import save_choice
+            save_choice(index, name)
+        except Exception:                             # noqa: BLE001 - 记不住也不影响采集
+            pass
+        hint = getattr(self, 'device_hint', None)
+        if hint is not None and name:
+            hint.setText('当前：{}（index {}）'.format(name, index))
+
+    def _selected_index(self) -> int:
+        """下拉框当前选中的 index；还没扫到时用占位项的值。"""
+        data = self.device_combo.currentData() if hasattr(self, 'device_combo') else None
+        if data is None:
+            window = self.window_ref
+            fallback = getattr(window, 'camera_index_choice', None)
+            if fallback is None:
+                fallback = getattr(getattr(window, 'cfg', None), 'camera_index', 0)
+            return int(fallback or 0)
+        return int(data)
+
     # ------------------------------------------------------------- 控制
     def _toggle(self) -> None:
         window = self.window_ref
@@ -1429,10 +1545,11 @@ class CameraPage(BasePage):
             self.start_button.setObjectName('Primary')
             self.start_button.setStyle(self.start_button.style())
             self.status_pill.setText('已停止')
+            self._set_device_enabled(True)
             return
         width, height = self.size_combo.currentData()
         config = {
-            'index': int(self.device_spin.value()),
+            'index': self._selected_index(),
             'width': width,
             'height': height,
             'fps': float(self.fps_spin.value()),
@@ -1451,9 +1568,19 @@ class CameraPage(BasePage):
         self.start_button.setObjectName('Danger')
         self.start_button.setStyle(self.start_button.style())
         self.status_pill.setText('采集中')
+        self._set_device_enabled(False)               # 采集中不让换设备（DShow 独占）
         # 勾了「启用打哈欠检测」就在采集启动后加载模型（首次约 2~5 秒）
         if self.yawn_check.isChecked():
             self._on_yawn_toggled(True)
+
+    def _set_device_enabled(self, enabled: bool) -> None:
+        """采集中禁用设备下拉与刷新，避免"点了没反应"的困惑。"""
+        for widget in (getattr(self, 'device_combo', None), getattr(self, 'scan_button', None)):
+            if widget is not None:
+                widget.setEnabled(enabled)
+        hint = getattr(self, 'device_hint', None)
+        if hint is not None and not enabled:
+            hint.setText('采集中（停止后可换设备）')
 
     def _on_yawn_toggled(self, checked: bool) -> None:
         window = self.window_ref
@@ -1632,6 +1759,18 @@ class MonitorWindow(QMainWindow):
         self.camera_service: Optional[CameraService] = None
         self.camera_factory = None                    # 测试/自检可注入假摄像头
         self.camera_config: Dict[str, Any] = {}
+        # 用户在摄像头页选过的设备（index 或名字）。None = 还没选过，按 config.ini。
+        # 放在窗口上是为了让「设备准备页 / 重启采集 / 命令行」都走同一个选择。
+        self.camera_index_choice: Optional[int] = None
+        self.camera_name_choice: str = ''
+        try:
+            from devices.camera_devices import load_choice
+            _choice = load_choice()
+            if _choice:
+                self.camera_index_choice = int(_choice.get('index', 0) or 0)
+                self.camera_name_choice = str(_choice.get('name') or '')
+        except Exception:                             # noqa: BLE001 - 读不到就用配置值
+            pass
         self.status = status or DeviceStatus()
         self.ble_start = ble_start
         self.ble_stop = ble_stop
@@ -2026,8 +2165,15 @@ class MonitorWindow(QMainWindow):
 
         默认 15fps 而不是 30fps：哈欠检测本身只有 6~7Hz，帧率翻倍只会让
         会话库里的 JPEG 翻倍（一场 100 分钟从 4 GB 涨到 8 GB）。
+
+        index 优先用「摄像头页选过的那台」（存在 data/camera_prefs.json），
+        没选过才退回 config.ini 的 [camera] index —— 插拔 USB 后序号会漂，
+        用户选一次就该一直用那台。
         """
-        return {'index': int(getattr(self.cfg, 'camera_index', 0)),
+        index = self.camera_index_choice
+        if index is None:
+            index = int(getattr(self.cfg, 'camera_index', 0))
+        return {'index': int(index),
                 'width': int(getattr(self.cfg, 'camera_width', 640)),
                 'height': int(getattr(self.cfg, 'camera_height', 480)),
                 'fps': float(getattr(self.cfg, 'camera_fps', 15.0)),
